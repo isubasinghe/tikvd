@@ -33,9 +33,7 @@ impl Sorter {
             .retain(|region, _| self.required_regions.contains(region));
     }
 
-    pub fn mark_unregistered(&mut self, region_id: u64) {
-        self.required_regions.insert(region_id);
-    }
+    pub fn mark_unregistered(&mut self, _region_id: u64) {}
 
     pub fn set_resolved(&mut self, region_id: u64, ts: u64) {
         if !self.required_regions.contains(&region_id) {
@@ -137,6 +135,22 @@ mod tests {
         let (events, watermark) = sorter.drain();
         assert!(events.is_empty());
         assert_eq!(watermark, 50);
+    }
+
+    #[test]
+    fn unregistering_a_region_outside_the_set_does_not_hold_the_watermark() {
+        let mut sorter = Sorter::new(1 << 20);
+        sorter.set_regions(&[1, 2]);
+        sorter.set_resolved(1, 50);
+        sorter.set_resolved(2, 50);
+        sorter.drain();
+        sorter.set_regions(&[1, 3]);
+        sorter.set_resolved(1, 100);
+        sorter.set_resolved(3, 100);
+        sorter.mark_unregistered(2);
+        sorter.set_resolved(1, 500);
+        sorter.set_resolved(3, 500);
+        assert_eq!(sorter.drain().1, 500);
     }
 
     #[test]
