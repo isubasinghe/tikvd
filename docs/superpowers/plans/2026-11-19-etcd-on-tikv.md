@@ -201,7 +201,6 @@ impl Assembler { pub fn new() -> Self; pub fn on_row(&mut self, row: cdcpb::even
 impl Sorter {
     pub fn new(memory_limit_bytes: usize) -> Self;
     pub fn set_regions(&mut self, region_ids: &[u64]);              // regions that must all be resolved
-    pub fn mark_unregistered(&mut self, region_id: u64);
     pub fn set_resolved(&mut self, region_id: u64, ts: u64);
     pub fn push(&mut self, event: ChangeEvent) -> Result<(), SorterFull>;
     pub fn drain(&mut self) -> (Vec<ChangeEvent>, i64);            // events <= watermark in order, and the watermark
@@ -213,7 +212,7 @@ Row handling: `COMMITTED` → event now; `PREWRITE` → held by `(key, start_ts)
   - `committed_row_is_an_event`; `prewrite_then_commit_joins` (value from prewrite, revision from commit); `rollback_drops_prewrite`; `commit_without_prewrite_is_none`.
   - `no_old_value_is_create`; `delete_row_has_no_current_and_has_previous`.
   - `drain_orders_by_revision_across_regions`: push revisions 30, 10, 20, resolve both regions to 25 → drains `[10, 20]`, watermark 25; 30 stays.
-  - `unresolved_region_holds_watermark` (Review Focus 3): regions {1, 2}, region 1 resolved to 100, region 2 never → drains nothing, watermark 0. Then `mark_unregistered(2)` after it had resolved to 50 and region 1 moves to 200 → watermark stays 50.
+  - `unresolved_region_holds_watermark` (Review Focus 3): regions {1, 2}, region 1 resolved to 100, region 2 never → drains nothing, watermark 0. Then region 2 resolves to 50 and region 1 moves to 200 → watermark 50.
   - `replayed_event_is_deduplicated`: same `(key, revision)` pushed twice drains once.
   - `event_at_or_below_watermark_after_reregister_is_dropped`: pushing revision 5 when the watermark is already 10 does not emit it.
   - `over_limit_is_sorter_full`.
@@ -235,7 +234,7 @@ pub struct FeedConfig { pub stalled_lock_threshold: Duration, pub unhealthy_afte
 pub fn spawn_feed(store: Store, config: FeedConfig) -> (tokio::sync::mpsc::Receiver<FeedOutput>, FeedHealth);
 impl FeedHealth { pub fn is_serving(&self) -> bool; }   // false until the first watermark, and when stalled past unhealthy_after
 ```
-Behaviour, per the spec's Watch section steps 1–6: one `EventFeed` stream per store; register each region with `extra_op = ReadOldValue`, `kv_api = TiDB`, its epoch, and `checkpoint_ts`; on a region error re-resolve that key range through `regions_in_range` and re-register from the range's last resolved timestamp, calling `mark_unregistered` meanwhile; when a region lags the newest resolved timestamp by more than `stalled_lock_threshold`, call the client's lock cleanup for that region's range with a safepoint of `now - stalled_lock_threshold`. `FeedOutput::Reset` is sent, and the feed restarts from a fresh timestamp, on `SorterFull` or when TiKV rejects a checkpoint as older than GC. The feed sends an `Events` output with an empty vector when only the watermark moved.
+Behaviour, per the spec's Watch section steps 1–6: one `EventFeed` stream per store; register each region with `extra_op = ReadOldValue`, `kv_api = TiDB`, its epoch, and `checkpoint_ts`; on a region error re-resolve that key range through `regions_in_range` and re-register from the range's last resolved timestamp (a region with no live registration simply stops reporting, which holds the watermark); when a region lags the newest resolved timestamp by more than `stalled_lock_threshold`, call the client's lock cleanup for that region's range with a safepoint of `now - stalled_lock_threshold`. `FeedOutput::Reset` is sent, and the feed restarts from a fresh timestamp, on `SorterFull` or when TiKV rejects a checkpoint as older than GC. The feed sends an `Events` output with an empty vector when only the watermark moved.
 
 - [ ] **Step 1:** Write `tests/it_feed.rs`:
   - `sees_writes_in_commit_order`: write 50 keys from 5 concurrent tasks through `Store`; collected events have strictly increasing `revision`, and the multiset of `(key, revision)` equals what the `write` calls returned.
