@@ -77,7 +77,12 @@ but not observed.
    - Two-phase commit of two keys: one `PREWRITE` row per key (value, old
      value, `commit_ts` 0), then one `COMMIT` row per key (`commit_ts` and
      value, old value empty). The old value is only on the `PREWRITE` row.
-   - Delete: op type `DELETE`, empty value, old value set.
+   - One-phase delete: one `COMMITTED` row, op type `DELETE`, empty value,
+     old value set.
+   - Two-phase delete of two keys: one `PREWRITE` row per key (op type
+     `DELETE`, empty value, old value set, `commit_ts` 0), then one
+     `COMMIT` row per key (op type `DELETE`, `commit_ts`, empty value, old
+     value empty).
    - Incremental-scan rows are `COMMITTED` with old values, ordered by key
      and newest first within a key, not by commit timestamp.
 2. Key encoding. `start_key` and `end_key` in `ChangeDataRequest` must be
@@ -91,7 +96,8 @@ but not observed.
    (`k/one` arrives as `6B2F6F6E65`). PD region bounds are memcomparable
    too.
 3. Transactional change events are sent to subscriptions that use
-   `kv_api = TiDB`. `TxnKV` on this API V1 cluster gets a per-region
+   `kv_api = TiDB`. `TxnKV` on this cluster (`storage.api-version = 1` in
+   TiKV's `/config`) gets a per-region
    `Error` with `compatibility.required_version = "6.2.0"` and no rows.
 4. With `cdc.min-ts-interval = "200ms"`, `ResolvedTs` advances every
    200ms on an idle cluster: over a 35s run on v8.5.6 (writes only in
@@ -99,16 +105,23 @@ but not observed.
    202.6ms of physical time (min 199, max 251). It advances equally for a
    registered region that has never had a write. It arrives as one
    store-level `ChangeDataEvent.resolved_ts` per tick listing all
-   registered regions, with `request_id` 0 (batch resolved ts, enabled by
-   sending `header.ticdc_version` 8.5.0, without the stream-multiplexing
-   header). From source: the default is 1s.
+   registered regions, with `request_id` 0, when `header.ticdc_version` is
+   8.5.0 or 4.0.8. With 4.0.7 or an empty string it arrives instead as a
+   per-region `Event::ResolvedTs` carrying the registration's
+   `request_id`, at the same cadence. The stream-multiplexing header was
+   not tried. From source: the default interval is 1s.
 5. A raw `kvrpcpb.Get` with `need_commit_ts = true` returns a `commit_ts`
    equal to the timestamp `Transaction::commit` returned, for one-phase
-   and two-phase commits. Without the flag it returns 0; for a deleted key
-   it returns `not_found` and 0. Released tags where this holds: v8.5.6
-   and v8.5.8. Where it returns 0: v7.5.8, v8.1.0, v8.5.0, v8.5.4, v8.5.5
-   and v9.0.0-beta.1. Both images are pinned to v8.5.6. From source:
-   `BatchGet` accepts the flag too and `Scan` does not.
+   and two-phase commits, on v8.5.6, v8.5.8 and nightly. Without the flag
+   it returns 0; for a deleted key it returns `not_found` and 0. A read of
+   a two-phase secondary key sent right after `commit` returned once got a
+   `KeyError` with that transaction's lock instead. Tags tested: v7.5.8,
+   v8.1.0, v8.5.0, v8.5.4, v8.5.5, v8.5.6, v8.5.8, v9.0.0-beta.1 and
+   nightly. It holds on v8.5.6, v8.5.8 and nightly and returns 0 on the
+   rest. Both images are pinned to v8.5.6, the oldest tag tested on which
+   it holds. Other tags, including v8.5.1 to v8.5.3, v8.5.7 and
+   everything before v7.5.8, were not tested.
+   From source: `BatchGet` accepts the flag too and `Scan` does not.
 6. `Transaction::commit` in `tikv-client` 0.4.0 returns `Some` commit
    timestamp for one-phase and two-phase commits. From source: it does not
    set `need_commit_ts`, does not expose CDC, and keeps its protobuf types
