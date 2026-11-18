@@ -320,10 +320,7 @@ impl<PdC: PdClient> Transaction<PdC> {
         if response.not_found {
             return Ok(None);
         }
-        Ok(Some((
-            response.value,
-            Timestamp::from_version(response.commit_ts),
-        )))
+        Ok(Some((response.value, known_commit_ts(response.commit_ts)?)))
     }
 
     pub async fn batch_get_with_commit_ts(
@@ -348,14 +345,14 @@ impl<PdC: PdClient> Transaction<PdC> {
             .merge(CollectError)
             .plan();
         let responses = plan.execute().await?;
-        Ok(responses
+        responses
             .into_iter()
             .flat_map(|response| response.pairs)
             .map(|pair| {
-                let commit_ts = Timestamp::from_version(pair.commit_ts);
-                (KvPair::from(pair).truncate_keyspace(keyspace), commit_ts)
+                let commit_ts = known_commit_ts(pair.commit_ts)?;
+                Ok((KvPair::from(pair).truncate_keyspace(keyspace), commit_ts))
             })
-            .collect())
+            .collect()
     }
 
     /// Create a new 'batch get for update' request.
@@ -1779,6 +1776,15 @@ impl<PdC: PdClient> Committer<PdC> {
     }
 }
 
+fn known_commit_ts(commit_ts: u64) -> Result<Timestamp> {
+    if commit_ts == 0 {
+        return Err(Error::ProtocolViolation {
+            message: "TiKV server did not return a commit timestamp, so it does not support need_commit_ts".to_owned(),
+        });
+    }
+    Ok(Timestamp::from_version(commit_ts))
+}
+
 /// Is the outcome of a commit-point request unknown?
 ///
 /// Two ways to lose certainty: we failed to receive a response (a gRPC error — the
@@ -2025,5 +2031,43 @@ mod tests {
                 ..Default::default()
             })
         )));
+    }
+
+    #[tokio::test]
+    async fn commit_ts_reads_reject_a_found_key_without_commit_ts() {
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            |req: &dyn Any| {
+                if req.downcast_ref::<kvrpcpb::GetRequest>().is_some() {
+                    Ok(Box::new(kvrpcpb::GetResponse {
+                        value: b"v".to_vec(),
+                        ..Default::default()
+                    }) as Box<dyn Any>)
+                } else {
+                    Ok(Box::new(kvrpcpb::BatchGetResponse {
+                        pairs: vec![kvrpcpb::KvPair {
+                            key: b"k".to_vec(),
+                            value: b"v".to_vec(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }) as Box<dyn Any>)
+                }
+            },
+        )));
+        let mut txn = Transaction::new(
+            Timestamp::from_version(10),
+            pd_client,
+            TransactionOptions::new_optimistic().read_only(),
+            Keyspace::Disable,
+        );
+
+        assert!(matches!(
+            txn.get_with_commit_ts("k".to_owned()).await,
+            Err(crate::Error::ProtocolViolation { .. })
+        ));
+        assert!(matches!(
+            txn.batch_get_with_commit_ts(vec!["k".to_owned()]).await,
+            Err(crate::Error::ProtocolViolation { .. })
+        ));
     }
 }
