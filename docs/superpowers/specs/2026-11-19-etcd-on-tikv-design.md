@@ -59,24 +59,61 @@ plus a SQL layer. Rejected for the same reason as A.
 
 ## Facts this design rests on
 
-Checked against `tikv/tikv`, `pingcap/kvproto` and `tikv/client-rust`
-(0.4.0) at their default branches on 2026-11-19.
+Observed on 2026-11-19 against one PD and one TiKV in Docker
+(`dev/docker-compose.yml`, `cdc.min-ts-interval = "200ms"`), on the pinned
+v8.5.6 and on nightly (9.0.0-beta.2), with unpatched `tikv-client` 0.4.0
+writing and gRPC bindings generated from `pingcap/kvproto` master reading.
+Items marked "from source" were read in `tikv/tikv` and `tikv/client-rust`
+but not observed.
 
 1. CDC is a bidirectional gRPC stream per TiKV store
    (`cdcpb.ChangeData/EventFeed`). The client registers each region
-   separately with its epoch, a key range and a `checkpoint_ts`. Rows carry
-   `start_ts`, `commit_ts`, key, value and optionally the old value. A
-   `ResolvedTs` message periodically states a timestamp per region below
-   which no further commits will appear.
-2. Transactional change events are only sent to subscriptions that use
-   `kv_api = TiDB` (the default). `TxnKV` is rejected as unsupported.
-3. `cdc.min-ts-interval` defaults to 1s. Config validation only rejects 0.
-4. `Get` and `BatchGet` accept `need_commit_ts` and return each key's commit
-   timestamp. `Scan` does not.
-5. `tikv-client` does not set `need_commit_ts`, does not expose CDC, and
-   keeps its generated protobuf types and its PD/region client private.
-   `Transaction::commit` does return the commit timestamp, including for
-   one-phase commit.
+   separately with its epoch, a key range and a `checkpoint_ts`, and gets
+   one `INITIALIZED` row per registration when its incremental scan ends.
+   Keys written under `k/` by `tikv-client` (optimistic, `try_one_pc`)
+   arrive as rows:
+   - One-phase commit, one key or two keys in one region: one `COMMITTED`
+     row per key, carrying `start_ts`, `commit_ts`, value and old value.
+   - Two-phase commit of two keys: one `PREWRITE` row per key (value, old
+     value, `commit_ts` 0), then one `COMMIT` row per key (`commit_ts` and
+     value, old value empty). The old value is only on the `PREWRITE` row.
+   - Delete: op type `DELETE`, empty value, old value set.
+   - Incremental-scan rows are `COMMITTED` with old values, ordered by key
+     and newest first within a key, not by commit timestamp.
+2. Key encoding. `start_key` and `end_key` in `ChangeDataRequest` must be
+   memcomparable-encoded (TiKV's bytes codec: 8-byte groups padded with
+   `0x00`, each followed by `0xFF` minus the pad count). `[k/, k0)` is sent
+   as `[6B2F000000000000F9, 6B30000000000000F9)`. Raw bounds are not
+   rejected to the client: TiKV logs "cdc invalid observed start key or end
+   key version" and silently observes the whole region, so a key outside
+   the range (`j/outside`) was delivered. An empty `end_key` takes the same
+   path and also means the whole region. The `key` in event rows is raw
+   (`k/one` arrives as `6B2F6F6E65`). PD region bounds are memcomparable
+   too.
+3. Transactional change events are sent to subscriptions that use
+   `kv_api = TiDB`. `TxnKV` on this API V1 cluster gets a per-region
+   `Error` with `compatibility.required_version = "6.2.0"` and no rows.
+4. With `cdc.min-ts-interval = "200ms"`, `ResolvedTs` advances every
+   200ms on an idle cluster: over a 35s run on v8.5.6 (writes only in
+   0.1s of it), 172 messages, mean step
+   202.6ms of physical time (min 199, max 251). It advances equally for a
+   registered region that has never had a write. It arrives as one
+   store-level `ChangeDataEvent.resolved_ts` per tick listing all
+   registered regions, with `request_id` 0 (batch resolved ts, enabled by
+   sending `header.ticdc_version` 8.5.0, without the stream-multiplexing
+   header). From source: the default is 1s.
+5. A raw `kvrpcpb.Get` with `need_commit_ts = true` returns a `commit_ts`
+   equal to the timestamp `Transaction::commit` returned, for one-phase
+   and two-phase commits. Without the flag it returns 0; for a deleted key
+   it returns `not_found` and 0. Released tags where this holds: v8.5.6
+   and v8.5.8. Where it returns 0: v7.5.8, v8.1.0, v8.5.0, v8.5.4, v8.5.5
+   and v9.0.0-beta.1. Both images are pinned to v8.5.6. From source:
+   `BatchGet` accepts the flag too and `Scan` does not.
+6. `Transaction::commit` in `tikv-client` 0.4.0 returns `Some` commit
+   timestamp for one-phase and two-phase commits. From source: it does not
+   set `need_commit_ts`, does not expose CDC, and keeps its protobuf types
+   and PD/region client private. Its default `prometheus` feature needs a
+   system OpenSSL to build.
 
 ## Assumptions
 

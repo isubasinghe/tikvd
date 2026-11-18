@@ -1,0 +1,33 @@
+name: tikvd-dev
+
+services:
+  pd:
+    image: pingcap/pd:v8.5.6
+    network_mode: host
+    command:
+      - --name=pd
+      - --data-dir=/data/pd
+      - --client-urls=http://127.0.0.1:2379
+      - --peer-urls=http://127.0.0.1:2380
+      - --initial-cluster=pd=http://127.0.0.1:2380
+
+  tikv:
+    image: pingcap/tikv:v8.5.6
+    network_mode: host
+    depends_on:
+      - pd
+    configs:
+      - source: tikv
+        target: /tikv.toml
+    command:
+      - --addr=127.0.0.1:20160
+      - --status-addr=127.0.0.1:20180
+      - --pd=127.0.0.1:2379
+      - --data-dir=/data/tikv
+      - --config=/tikv.toml
+
+configs:
+  tikv:
+    content: |
+      [cdc]
+      min-ts-interval = "200ms"
