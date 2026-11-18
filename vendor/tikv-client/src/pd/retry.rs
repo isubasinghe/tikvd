@@ -123,6 +123,10 @@ macro_rules! retry {
 }
 
 impl RetryClient<Cluster> {
+    pub async fn cluster_id(&self) -> u64 {
+        self.cluster.read().await.0.id()
+    }
+
     pub async fn connect(
         endpoints: &[String],
         security_mgr: Arc<SecurityManager>,

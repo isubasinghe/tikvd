@@ -8,6 +8,7 @@ use crate::Key;
 use crate::KvPair;
 use crate::Result;
 use crate::Scanner;
+use crate::Timestamp;
 use crate::Transaction;
 use crate::Value;
 
@@ -43,6 +44,22 @@ impl Snapshot {
     ) -> Result<impl Iterator<Item = KvPair>> {
         debug!("invoking batch_get request on snapshot");
         self.transaction.batch_get(keys).await
+    }
+
+    pub async fn get_with_commit_ts(
+        &mut self,
+        key: impl Into<Key>,
+    ) -> Result<Option<(Value, Timestamp)>> {
+        trace!("invoking get_with_commit_ts request on snapshot");
+        self.transaction.get_with_commit_ts(key).await
+    }
+
+    pub async fn batch_get_with_commit_ts(
+        &mut self,
+        keys: impl IntoIterator<Item = impl Into<Key>>,
+    ) -> Result<Vec<(KvPair, Timestamp)>> {
+        debug!("invoking batch_get_with_commit_ts request on snapshot");
+        self.transaction.batch_get_with_commit_ts(keys).await
     }
 
     /// Scan a range, return at most `limit` key-value pairs that lying in the range.

@@ -105,7 +105,7 @@ mod compat;
 mod config;
 mod kv;
 mod pd;
-mod proto;
+pub mod proto;
 mod region;
 mod region_cache;
 mod stats;
@@ -163,6 +163,8 @@ pub use crate::transaction::CheckLevel;
 pub use crate::transaction::Client as TransactionClient;
 #[doc(inline)]
 pub use crate::transaction::ProtoLockInfo;
+#[doc(inline)]
+pub use crate::transaction::RegionRoute;
 #[doc(inline)]
 pub use crate::transaction::Scanner;
 #[doc(inline)]

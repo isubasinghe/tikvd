@@ -298,6 +298,66 @@ impl<PdC: PdClient> Transaction<PdC> {
             .map(move |pairs| pairs.map(move |pair| pair.truncate_keyspace(keyspace)))
     }
 
+    pub async fn get_with_commit_ts(
+        &mut self,
+        key: impl Into<Key>,
+    ) -> Result<Option<(Value, Timestamp)>> {
+        trace!("invoking transactional get_with_commit_ts request");
+        self.check_allow_operation().await?;
+        let key = key.into().encode_keyspace(self.keyspace, KeyMode::Txn);
+        let mut request = new_get_request(key, self.timestamp.clone());
+        request.need_commit_ts = true;
+        let plan = PlanBuilder::new(self.rpc.clone(), self.keyspace, request)
+            .resolve_lock(
+                self.timestamp.clone(),
+                self.options.retry_options.lock_backoff.clone(),
+                self.keyspace,
+            )
+            .retry_multi_region(DEFAULT_REGION_BACKOFF)
+            .merge(CollectSingle)
+            .plan();
+        let response = plan.execute().await?;
+        if response.not_found {
+            return Ok(None);
+        }
+        Ok(Some((
+            response.value,
+            Timestamp::from_version(response.commit_ts),
+        )))
+    }
+
+    pub async fn batch_get_with_commit_ts(
+        &mut self,
+        keys: impl IntoIterator<Item = impl Into<Key>>,
+    ) -> Result<Vec<(KvPair, Timestamp)>> {
+        debug!("invoking transactional batch_get_with_commit_ts request");
+        self.check_allow_operation().await?;
+        let keyspace = self.keyspace;
+        let keys = keys
+            .into_iter()
+            .map(|k| k.into().encode_keyspace(keyspace, KeyMode::Txn));
+        let mut request = new_batch_get_request(keys, self.timestamp.clone());
+        request.need_commit_ts = true;
+        let plan = PlanBuilder::new(self.rpc.clone(), keyspace, request)
+            .resolve_lock(
+                self.timestamp.clone(),
+                self.options.retry_options.lock_backoff.clone(),
+                keyspace,
+            )
+            .retry_multi_region(self.options.retry_options.region_backoff.clone())
+            .merge(CollectError)
+            .plan();
+        let responses = plan.execute().await?;
+        Ok(responses
+            .into_iter()
+            .flat_map(|response| response.pairs)
+            .map(|pair| {
+                let commit_ts = Timestamp::from_version(pair.commit_ts);
+                (KvPair::from(pair).truncate_keyspace(keyspace), commit_ts)
+            })
+            .collect())
+    }
+
     /// Create a new 'batch get for update' request.
     ///
     /// Similar to [`get_for_update`](Transaction::get_for_update), but it works

@@ -286,6 +286,14 @@ impl<KvC: KvConnect + Send + Sync + 'static> PdClient for PdRpcClient<KvC> {
 }
 
 impl PdRpcClient<TikvConnect, Cluster> {
+    pub async fn cluster_id(&self) -> u64 {
+        self.pd.cluster_id().await
+    }
+
+    pub async fn store_address(&self, store_id: StoreId) -> Result<String> {
+        Ok(self.region_cache.get_store_by_id(store_id).await?.address)
+    }
+
     pub async fn connect(
         pd_endpoints: &[String],
         config: Config,

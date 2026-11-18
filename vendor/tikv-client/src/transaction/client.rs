@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use futures::TryStreamExt;
 use log::debug;
 use log::info;
 
@@ -9,6 +10,7 @@ use crate::backoff::{DEFAULT_REGION_BACKOFF, DEFAULT_STORE_BACKOFF};
 use crate::config::Config;
 use crate::pd::PdClient;
 use crate::pd::PdRpcClient;
+use crate::proto::metapb;
 use crate::proto::pdpb::Timestamp;
 use crate::request::plan::CleanupLocksResult;
 use crate::request::EncodeKeyspace;
@@ -26,6 +28,7 @@ use crate::transaction::Transaction;
 use crate::transaction::TransactionOptions;
 use crate::Backoff;
 use crate::BoundRange;
+use crate::Error;
 use crate::Result;
 
 /// Protobuf-generated lock information returned by TiKV.
@@ -37,6 +40,13 @@ pub use crate::proto::kvrpcpb::LockInfo as ProtoLockInfo;
 
 // FIXME: cargo-culted value
 const SCAN_LOCK_BATCH_SIZE: u32 = 1024;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegionRoute {
+    pub region: metapb::Region,
+    pub leader: metapb::Peer,
+    pub store_address: String,
+}
 
 /// The TiKV transactional `Client` is used to interact with TiKV using transactional requests.
 ///
@@ -249,6 +259,33 @@ impl Client {
     /// ```
     pub async fn current_timestamp(&self) -> Result<Timestamp> {
         self.pd.clone().get_timestamp().await
+    }
+
+    pub async fn cluster_id(&self) -> u64 {
+        self.pd.cluster_id().await
+    }
+
+    pub async fn regions_in_range(&self, range: impl Into<BoundRange>) -> Result<Vec<RegionRoute>> {
+        let range = range.into().encode_keyspace(self.keyspace, KeyMode::Txn);
+        let regions: Vec<_> = self
+            .pd
+            .clone()
+            .regions_for_range(range)
+            .try_collect()
+            .await?;
+        let mut routes = Vec::with_capacity(regions.len());
+        for region in regions {
+            let leader = region.leader.clone().ok_or_else(|| Error::LeaderNotFound {
+                region: region.ver_id(),
+            })?;
+            let store_address = self.pd.store_address(leader.store_id).await?;
+            routes.push(RegionRoute {
+                region: region.region,
+                leader,
+                store_address,
+            });
+        }
+        Ok(routes)
     }
 
     /// Request garbage collection (GC) of the TiKV cluster.
