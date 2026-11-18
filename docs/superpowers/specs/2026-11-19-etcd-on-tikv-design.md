@@ -215,12 +215,13 @@ Each `tikvd` instance runs one CDC consumer covering the `k/` range:
    at startup.
 2. Turn rows into committed events. A `COMMITTED` row is complete on its
    own; one-phase commits and incremental-scan rows arrive this way, so
-   this is the main path. A `PREWRITE` row (which carries the value) is
-   held until its `COMMIT` row (which carries the commit timestamp) with
-   the same key and start timestamp arrives, and dropped on `ROLLBACK`.
-   `INITIALIZED` marks the end of a region's incremental scan. Request old
-   values so `prev_kv` and delete events can be populated. An event with no
-   old value is a create.
+   this is the main path. A `PREWRITE` row (which carries the value and
+   the old value) is held until its `COMMIT` row (which carries only the
+   commit timestamp) with the same key and start timestamp arrives, and
+   dropped on `ROLLBACK`. `INITIALIZED` marks the end of a region's
+   incremental scan. Request old values so `prev_kv` and delete events can
+   be populated. An assembled event with no old value is a create; for a
+   two-phase write the old value is the one from the `PREWRITE` row.
 3. Hold committed events in a sorter ordered by commit timestamp,
    deduplicated by key and commit timestamp, because re-registering a
    region replays events above its last resolved timestamp.
