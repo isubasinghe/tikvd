@@ -71,6 +71,7 @@ pub enum WriteOutcome {
 #[derive(Debug)]
 pub enum StoreError {
     Compacted,
+    FutureRevision,
     Corrupt(Vec<u8>),
     Tikv(tikv_client::Error),
 }
@@ -79,6 +80,7 @@ impl fmt::Display for StoreError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             StoreError::Compacted => write!(f, "requested revision has been compacted"),
+            StoreError::FutureRevision => write!(f, "requested revision is in the future"),
             StoreError::Corrupt(key) => write!(f, "corrupt record for key {key:?}"),
             StoreError::Tikv(error) => write!(f, "tikv: {error}"),
         }
@@ -202,6 +204,12 @@ impl Store {
     }
 
     pub async fn compact(&self, revision: i64) -> Result<(), StoreError> {
+        if revision <= 0 {
+            return Err(StoreError::Compacted);
+        }
+        if revision > self.now().await? {
+            return Err(StoreError::FutureRevision);
+        }
         self.client
             .gc(Timestamp::from_version(revision as u64))
             .await?;

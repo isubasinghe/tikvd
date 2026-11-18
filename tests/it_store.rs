@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use tikv_client::TransactionOptions;
 use tikvd::keys::{parse_ttl_key, ttl_range_until};
-use tikvd::store::{Compare, KeyValue, RangeQuery, Store, Write, WriteOutcome};
+use tikvd::store::{Compare, KeyValue, RangeQuery, Store, StoreError, Write, WriteOutcome};
 
 async fn test_store() -> Option<Store> {
     let Ok(pd) = std::env::var("TIKVD_TEST_PD") else {
@@ -472,4 +472,28 @@ async fn now_is_a_fresh_timestamp() {
     let second = store.now().await.unwrap();
     assert!(first > 0);
     assert!(second > first);
+}
+
+#[tokio::test]
+async fn compact_rejects_non_positive_revision() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    assert!(matches!(store.compact(0).await, Err(StoreError::Compacted)));
+    assert!(matches!(
+        store.compact(-1).await,
+        Err(StoreError::Compacted)
+    ));
+}
+
+#[tokio::test]
+async fn compact_rejects_future_revision() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let future = store.now().await.unwrap() + (1 << 40);
+    assert!(matches!(
+        store.compact(future).await,
+        Err(StoreError::FutureRevision)
+    ));
 }
