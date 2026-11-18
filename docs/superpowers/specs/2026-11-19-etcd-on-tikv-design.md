@@ -1,0 +1,278 @@
+# tikvd: an etcd v3 front-end for TiKV
+
+Status: draft for approval. 2026-11-19.
+
+## Intent
+
+Run Kubernetes with TiKV as its datastore instead of etcd. `tikvd` is a
+stateless Rust server that speaks the part of etcd's v3 gRPC API that
+kube-apiserver uses, and keeps all state in a TiKV cluster.
+
+The reason for building it, rather than using something that exists, is
+scale: any number of `tikvd` instances must be able to serve the same
+cluster, and write throughput must not be capped by a single serialised
+sequence the way etcd, Kine, or a counter-key design are.
+
+## Goals
+
+- kube-apiserver runs unmodified against one or more `tikvd` endpoints.
+- Any number of `tikvd` instances serve the same TiKV cluster at once, with
+  no coordination between them and no instance-local durable state.
+- Writes to different keys do not contend with each other.
+- Acceptance test: a k3s server started with `--datastore-endpoint` pointing
+  at two `tikvd` instances comes up healthy, Argo Workflows installs on it,
+  and a hello-world workflow runs to `Succeeded`.
+
+## Non-goals
+
+- Full etcd compatibility. Only what kube-apiserver sends is supported;
+  everything else returns `UNIMPLEMENTED`. `etcdctl get/put/del/watch` on
+  single keys and prefixes should work as a side effect, for debugging.
+- etcd's Auth, Cluster (member add/remove), Lock and Election services.
+- Exact `create_revision`. Only whether it equals `mod_revision` is kept
+  exact, because kube-apiserver uses that to tell a create from an update.
+- Sharing the TiKV cluster with other users. See Assumptions.
+- Dense revisions. Revisions increase but have large gaps.
+- Running or managing TiKV and PD. They are assumed to exist.
+
+## Anti-goals
+
+- A lost or reordered watch event. Kubernetes controllers silently diverge
+  when this happens, so correctness of watch beats latency and throughput
+  everywhere they conflict.
+- Any design where correctness depends on there being one `tikvd`.
+
+## Approaches considered
+
+**A. Counter key.** Every write bumps one revision counter in the same TiKV
+transaction and appends to a revision-ordered log; watch tails the log.
+Simple and correct, but all writes contend on one key. Rejected: it caps
+write throughput, which is the reason this project exists.
+
+**B. TiKV commit timestamps as revisions, watch fed by TiKV CDC.** No shared
+write key. Costs: a hand-written CDC client, and watch delivery that trails
+real time by TiKV's resolved-timestamp interval. **Chosen** by the user for
+write scalability.
+
+**C. Kine on TiDB.** No code, but the same single-sequence bottleneck as A
+plus a SQL layer. Rejected for the same reason as A.
+
+## Facts this design rests on
+
+Checked against `tikv/tikv`, `pingcap/kvproto` and `tikv/client-rust`
+(0.4.0) at their default branches on 2026-11-19.
+
+1. CDC is a bidirectional gRPC stream per TiKV store
+   (`cdcpb.ChangeData/EventFeed`). The client registers each region
+   separately with its epoch, a key range and a `checkpoint_ts`. Rows carry
+   `start_ts`, `commit_ts`, key, value and optionally the old value. A
+   `ResolvedTs` message periodically states a timestamp per region below
+   which no further commits will appear.
+2. Transactional change events are only sent to subscriptions that use
+   `kv_api = TiDB` (the default). `TxnKV` is rejected as unsupported.
+3. `cdc.min-ts-interval` defaults to 1s. Config validation only rejects 0.
+4. `Get` and `BatchGet` accept `need_commit_ts` and return each key's commit
+   timestamp. `Scan` does not.
+5. `tikv-client` does not set `need_commit_ts`, does not expose CDC, and
+   keeps its generated protobuf types and its PD/region client private.
+   `Transaction::commit` does return the commit timestamp, including for
+   one-phase commit.
+
+## Assumptions
+
+These are the builder's calls, not decisions the user made.
+
+- The TiKV cluster is dedicated to `tikvd` and runs API V1. Compaction
+  moves the cluster-wide GC safepoint, which would destroy history for any
+  other tenant.
+- The target is the current stable k3s release at the time step 4 starts.
+  The exact request shapes in this document are from memory of
+  kube-apiserver's etcd3 storage code and are confirmed in step 1 by
+  logging every request a real k3s server sends and failing loudly on any
+  unsupported one.
+
+## Design
+
+### Revisions
+
+An etcd revision is a TiKV commit timestamp. This is forced, not chosen:
+the resolved timestamp is a promise about commit timestamps only. A
+revision taken from anything else (a transaction's start timestamp, or a
+timestamp fetched mid-transaction and stored in the value) can commit after
+the watermark has already passed it, which would deliver a watch event out
+of order.
+
+Consequences:
+
+- A write's response revision is the timestamp returned by `commit`.
+- A key's `mod_revision` is the commit timestamp of its latest version,
+  read back with `need_commit_ts`. It is never stored in the value, because
+  it is not known until after commit.
+- A read at revision R is a TiKV snapshot read at timestamp R.
+- A read "now" fetches a fresh timestamp T from PD, reads a snapshot at T,
+  and reports T as the header revision. TiKV snapshot isolation guarantees
+  that every commit at or below T is in the result and none will appear
+  later, so "list at T, then watch from T+1" has no gap and no overlap.
+
+### Data layout
+
+All keys live under one fixed prefix so the CDC subscription and scans are
+bounded.
+
+- `k/<etcd key>` → record: `version` (count of writes since creation),
+  `created` (start timestamp of the creating transaction), `lease` (expiry
+  time in unix seconds, or 0), then the value bytes.
+
+`create_revision` is reported as `mod_revision` when `version` is 1, and as
+`created` otherwise. `created` is always lower than any later commit, so
+the two are equal exactly on a create.
+- `l/<expiry, big-endian>/<etcd key>` → empty. TTL index for the reaper.
+
+An etcd delete is a TiKV delete. There is no tombstone record.
+
+### KV and Txn
+
+Supported requests, matching what kube-apiserver sends:
+
+- `Range`: single key, or key range with `limit`, `revision`, `keys_only`,
+  `count_only`. A range read is a `Scan` at the snapshot followed by a
+  `BatchGet` with `need_commit_ts` on the returned keys, to fill in
+  `mod_revision`. Paging works by the caller passing the same `revision`
+  with a new start key. With a `limit`, `more` is exact (scan one extra
+  key) and `count` is exact (a keys-only scan of the whole range).
+- `Txn` in exactly these shapes: compare one key's `mod_revision` (to 0 for
+  create, to a value for update or delete) or its `version` (used by
+  kube-apiserver's compactor), then one `Put` or `DeleteRange` on that key,
+  else an optional `Range` on that key. The nested `Put` response carries
+  its own header with the new revision.
+- Bare `Put` and single-key or range `DeleteRange`.
+- `Compact`.
+
+A write runs as an optimistic TiKV transaction with one-phase commit
+requested: read the key with its commit timestamp, evaluate the compare,
+write, commit. TiKV's own write-conflict check makes the compare-and-write
+atomic. On write conflict the whole operation is retried from the read, so
+the compare is re-evaluated against the new state. A put with a lease also
+writes the TTL index key, and removes the old index key if the expiry
+changed.
+
+### Watch
+
+Each `tikvd` instance runs one CDC consumer covering the `k/` range:
+
+1. Discover the regions covering the range from PD and open one `EventFeed`
+   stream per store, registering each region from a `checkpoint_ts` taken
+   at startup.
+2. Turn rows into committed events. A `COMMITTED` row is complete on its
+   own; one-phase commits and incremental-scan rows arrive this way, so
+   this is the main path. A `PREWRITE` row (which carries the value) is
+   held until its `COMMIT` row (which carries the commit timestamp) with
+   the same key and start timestamp arrives, and dropped on `ROLLBACK`.
+   `INITIALIZED` marks the end of a region's incremental scan. Request old
+   values so `prev_kv` and delete events can be populated. An event with no
+   old value is a create.
+3. Hold committed events in a sorter ordered by commit timestamp,
+   deduplicated by key and commit timestamp, because re-registering a
+   region replays events above its last resolved timestamp.
+4. Track the resolved timestamp per region. The watermark is the minimum
+   across all regions covering the range. Release events at or below the
+   watermark, in commit-timestamp order, to a bounded in-memory window and
+   to subscribed watchers.
+5. On a region error (leader moved, split, merge, epoch change), look the
+   range up again in PD and re-register the affected regions from that
+   range's last resolved timestamp. The watermark does not advance past a
+   range that has no live registration.
+6. When a region's resolved timestamp falls behind by more than a
+   threshold, scan that region for locks older than the threshold and
+   resolve them with the client's lock-cleanup calls. A put with a lease
+   spans two regions and so commits in two phases; a `tikvd` that crashes
+   mid-commit leaves a lock that would otherwise hold the watermark back
+   for every instance.
+
+A stalled watermark is safe: watches and progress notifications pause, and
+nothing wrong is delivered. An instance whose watermark has been stalled
+past a second threshold reports not serving. If the sorter exceeds its
+memory bound, or TiKV rejects a registration because GC has passed its
+checkpoint, the instance cancels all its watches with etcd's compacted
+error and restarts its subscription from a fresh timestamp.
+
+A client watch with start revision R:
+
+- R within the window: replay from the window, then follow live.
+- R is 0: fetch a timestamp T from PD and deliver events above T.
+- R older than the window, or older than the instance's start: fail the
+  watch with etcd's compacted error. kube-apiserver responds by relisting.
+
+Progress notifications and `WatchProgressRequest` report the watermark.
+
+Watch delivery lags commits by the resolved-timestamp interval. The
+deployment guidance is to set `cdc.min-ts-interval` to about 200ms.
+
+### Leases
+
+kube-apiserver uses leases only to give keys a TTL. `LeaseGrant` returns an
+ID that encodes the TTL and stores nothing. A put with that lease computes
+the expiry and writes it in the record and the TTL index. Every instance
+runs a reaper that scans the index up to the current time and deletes
+expired keys through the normal write path, conditional on the record still
+carrying that expiry. Racing reapers conflict harmlessly, and watchers see
+ordinary delete events. `LeaseRevoke` and `LeaseKeepAlive` are not needed
+by kube-apiserver and return `UNIMPLEMENTED`.
+
+### Compaction
+
+`Compact(R)` advances TiKV's GC safepoint to R. Reads below the safepoint
+map TiKV's error to etcd's compacted error.
+
+### Maintenance and serving
+
+`Status` reports a fixed etcd version of 3.5.13 (new enough for
+kube-apiserver to enable watch-progress requests) and the current
+watermark as its revision. gRPC health reports serving once the CDC
+consumer has a watermark. TLS is optional, enabled by certificate flags.
+
+### TiKV client
+
+`tikvd` depends on a vendored copy of `tikv-client` under `vendor/`, with a
+small patch that adds commit-timestamp-returning `get` and `batch_get` and
+makes the generated protobuf types and the PD region lookup public. The CDC
+consumer uses those types. The patch is kept small enough to offer
+upstream. (Builder's call, made because nothing is published outside the
+repo this way.)
+
+## Known limits
+
+- Watch and progress lag by `cdc.min-ts-interval`.
+- Each instance holds its own CDC subscription to every region in the
+  range, so CDC load on TiKV grows with the number of instances.
+- `count` on a paged list rescans the range's keys on every page.
+  kube-apiserver only uses it as an estimate, so an approximate count is
+  the upgrade.
+- Restarting an instance makes every client watching through it relist.
+- A watch resuming from before an instance's in-memory window is told to
+  relist. Replaying older history from TiKV via a CDC incremental scan is
+  the upgrade if relists become a problem.
+- Range reads cost a scan plus a batch get.
+- `count_only` scans the whole range.
+- Requires a TiKV version whose `Get`/`BatchGet` honour `need_commit_ts`.
+
+## Order of work
+
+0. **Spike, throwaway.** Against a local TiKV + PD in Docker, confirm the
+   four things this design has not yet seen running: CDC with
+   `kv_api = TiDB` delivers events for keys written by `tikv-client` under
+   an arbitrary prefix; how keys and range bounds are encoded in CDC
+   requests and events; the resolved timestamp advances at a lowered
+   `min-ts-interval` on an idle cluster; and which TiKV release first
+   honours `need_commit_ts`. If any of these fails, stop and come back to
+   the design.
+1. KV and Txn over the patched client.
+2. CDC consumer and Watch.
+3. Leases, compaction, status.
+4. k3s and Argo Workflows acceptance, with two instances.
+
+## Left to the builder
+
+Crate layout, error types, flag names, the size of the watch window, retry
+and backoff policy, record encoding, logging and metrics, and how the local
+TiKV test cluster is started.
