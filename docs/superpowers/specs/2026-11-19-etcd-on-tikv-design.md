@@ -518,6 +518,24 @@ different versions 1 of 2.
   milliseconds of its response, which a resolved-timestamp watermark at
   10ms does not give.
 
+Re-run on 2026-11-19 after writes began to be acknowledged only once this
+instance had delivered them, with the data key as a leased put's primary,
+same cluster shape and suite, twice:
+
+- Full, `[Conformance]`, 30 and 29 min: 446 passed, 0 failed, 7133
+  skipped, both times. Gates: no `UNIMPLEMENTED`, no feed reset, cache
+  consistency asserted (441 and 421 checks, none failed). No write hit
+  the 1 s delivery deadline on either instance.
+- The CRD finalizer still met "storage is (re)initializing" (7 and 6
+  times), and every retry recovered: its retry read came 19 to 52 ms after
+  its own write and wrote.
+- kube-controller-manager logged 48 and 82 `is not as new as written
+  version` errors, against 1,140 before.
+- Mean `etcd_request_duration_seconds` at the end of the runs: create 38.0
+  and 38.6 ms, update 34.4 and 33.7, delete 25.7 and 24.4, get 1.8 and
+  1.5, list 1.9 and 1.6. Writes cost about 10 ms more than before, the
+  watermark lag they now wait out.
+
 ## Order of work
 
 0. **Spike, throwaway.** Against a local TiKV + PD in Docker, confirm the
