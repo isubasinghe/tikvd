@@ -19,7 +19,7 @@ fn unique_prefix() -> String {
         .unwrap()
         .as_nanos();
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("k/it-client-patch-{}-{nanos}-{n}/", std::process::id())
+    format!("zz-it-client-patch-{}-{nanos}-{n}/", std::process::id())
 }
 
 async fn put_and_commit(client: &TransactionClient, key: &str, value: &str) -> Timestamp {

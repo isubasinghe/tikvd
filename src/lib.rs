@@ -1,4 +1,7 @@
 pub mod cdc;
 pub mod keys;
+pub mod kv_service;
+pub mod pb;
 pub mod record;
+pub mod server;
 pub mod store;

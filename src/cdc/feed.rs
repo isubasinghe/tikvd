@@ -13,7 +13,7 @@ use tikv_client::{BoundRange, Key, RegionRoute, Timestamp, TimestampExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+use tonic::codegen::tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic::transport::Endpoint;
 use tracing::{debug, info, warn};
 
