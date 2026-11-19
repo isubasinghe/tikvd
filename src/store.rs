@@ -224,9 +224,7 @@ impl Store {
     }
 
     async fn begin_write(&self) -> Result<Transaction, StoreError> {
-        let options = TransactionOptions::new_optimistic()
-            .try_one_pc()
-            .drop_check(CheckLevel::None);
+        let options = TransactionOptions::new_optimistic().drop_check(CheckLevel::None);
         Ok(self.client.begin_with_options(options).await?)
     }
 

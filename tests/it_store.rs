@@ -167,6 +167,38 @@ async fn version_compare() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_writes_get_distinct_revisions() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let prefix = unique_prefix();
+
+    let tasks: Vec<_> = (0..50)
+        .map(|i| {
+            let store = store.clone();
+            let k = key(&prefix, &format!("distinct-{i}"));
+            tokio::spawn(async move {
+                store
+                    .write(&k, Some(Compare::ModRevision(0)), put("v"))
+                    .await
+                    .unwrap()
+            })
+        })
+        .collect();
+    let mut revisions = Vec::new();
+    for task in tasks {
+        match task.await.unwrap() {
+            WriteOutcome::Applied { revision, .. } => revisions.push(revision),
+            rejected => panic!("expected applied, got {rejected:?}"),
+        }
+    }
+
+    revisions.sort();
+    revisions.dedup();
+    assert_eq!(revisions.len(), 50, "revisions shared between writes");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_creates_one_winner() {
     let Some(store) = test_store().await else {
         return;

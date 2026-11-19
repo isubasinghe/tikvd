@@ -151,13 +151,10 @@ async fn sees_writes_in_commit_order() {
 
     let ours = collect_until(&mut rx, &prefix, newest, start).await;
 
-    let order: Vec<(i64, &[u8])> = ours
-        .iter()
-        .map(|e| (e.revision, e.key.as_slice()))
-        .collect();
+    let revisions: Vec<i64> = ours.iter().map(|e| e.revision).collect();
     assert!(
-        order.windows(2).all(|pair| pair[0] < pair[1]),
-        "events not in (revision, key) order or repeated: {order:?}"
+        revisions.windows(2).all(|pair| pair[0] < pair[1]),
+        "revisions not strictly increasing: {revisions:?}"
     );
     let mut seen: Vec<(Vec<u8>, i64)> = ours.into_iter().map(|e| (e.key, e.revision)).collect();
     seen.sort();
