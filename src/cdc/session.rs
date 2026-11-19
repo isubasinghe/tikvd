@@ -195,8 +195,6 @@ impl Session {
 
     pub fn on_tick(&mut self) -> Vec<Action> {
         let (events, watermark) = self.sorter.drain();
-        self.assembler
-            .prune_prewrites_below(u64::try_from(watermark).unwrap_or(0));
         if let Some(output) = release(events, watermark, self.config.floor, self.last_emitted) {
             self.last_emitted = Some(watermark);
             self.actions.push(Action::Emit(output));
@@ -374,6 +372,7 @@ impl Session {
         region.checkpoint = region.checkpoint.max(ts);
         region.reported = Some(ts);
         region.failures = 0;
+        self.assembler.on_resolved_ts(&region.range, request_id, ts);
         self.sorter.set_resolved(region_id, ts);
     }
 
@@ -999,14 +998,18 @@ mod tests {
     }
 
     fn two_regions(session: &mut Session) -> (Reg, Reg) {
+        two_regions_at(session, 150)
+    }
+
+    fn two_regions_at(session: &mut Session, resolved_ts: u64) -> (Reg, Reg) {
         let left = route(5, "", "m", 3);
         let right = route(2, "m", "~", 3);
         let actions = session.on_lookup(watched_range(), 0, Ok(vec![left, right]));
         let regs = registrations(&actions);
         let five = regs.iter().find(|r| r.region_id == 5).unwrap().clone();
         let two = regs.iter().find(|r| r.region_id == 2).unwrap().clone();
-        live(session, &five, 150);
-        live(session, &two, 150);
+        live(session, &five, resolved_ts);
+        live(session, &two, resolved_ts);
         session.on_tick();
         (five, two)
     }
@@ -1089,26 +1092,119 @@ mod tests {
         assert_eq!(watermarks(&emitted(&session.on_tick())), vec![500]);
     }
 
+    fn reregistered(actions: &[Action]) -> bool {
+        actions
+            .iter()
+            .any(|a| matches!(a, Action::Register { .. } | Action::Deregister { .. }))
+    }
+
+    fn holds(session: &Session, key: &str, start_ts: u64) -> bool {
+        !session
+            .assembler
+            .is_unmatched_commit(&commit(key, start_ts, start_ts + 1))
+    }
+
     #[test]
-    fn a_late_prewrite_pruned_below_the_watermark_is_not_lost() {
-        let mut session = session(100);
+    fn slow_transaction_prewriting_below_the_watermark_is_delivered_without_reregistration() {
+        let mut session = session(10);
+        let (five, two) = two_regions_at(&mut session, 100);
+        let mut actions = Vec::new();
+
+        actions.extend(session.on_change_data(five.stream, rows(&five, vec![prewrite("a", 50)])));
+        for ts in [110, 120, 130] {
+            actions.extend(session.on_change_data(two.stream, resolved(&two, ts)));
+            actions.extend(session.on_tick());
+        }
+        actions
+            .extend(session.on_change_data(five.stream, rows(&five, vec![commit("a", 50, 150)])));
+        actions.extend(session.on_change_data(five.stream, resolved(&five, 200)));
+        actions.extend(session.on_change_data(two.stream, resolved(&two, 200)));
+        actions.extend(session.on_tick());
+
+        assert_eq!(keyed(&emitted(&actions)), vec![(b"a".to_vec(), 150)]);
+        assert!(!reregistered(&actions), "{actions:?}");
+    }
+
+    #[test]
+    fn slow_prewrite_survives_repeated_unchanged_resolved_ts() {
+        let mut session = session(10);
         let reg = register_one(&mut session, route(1, "", "~", 1));
-        live(&mut session, &reg, 300);
+        live(&mut session, &reg, 100);
         session.on_tick();
+        let mut actions = Vec::new();
 
-        session.on_change_data(reg.stream, rows(&reg, vec![prewrite("w", 200)]));
+        actions.extend(session.on_change_data(reg.stream, rows(&reg, vec![prewrite("a", 50)])));
+        for _ in 0..10 {
+            actions.extend(session.on_change_data(reg.stream, resolved(&reg, 100)));
+            actions.extend(session.on_tick());
+        }
+        actions.extend(session.on_change_data(reg.stream, rows(&reg, vec![commit("a", 50, 150)])));
+        actions.extend(session.on_change_data(reg.stream, resolved(&reg, 200)));
+        actions.extend(session.on_tick());
+
+        assert_eq!(keyed(&emitted(&actions)), vec![(b"a".to_vec(), 150)]);
+        assert!(!reregistered(&actions), "{actions:?}");
+    }
+
+    #[test]
+    fn prewrite_is_dropped_after_two_resolved_timestamps_the_second_above_both() {
+        let mut session = session(10);
+        let reg = register_one(&mut session, route(1, "", "~", 1));
+        live(&mut session, &reg, 40);
+        session.on_change_data(reg.stream, rows(&reg, vec![prewrite("a", 50)]));
+        session.on_change_data(reg.stream, resolved(&reg, 60));
+        session.on_change_data(reg.stream, resolved(&reg, 70));
+        assert!(!holds(&session, "a", 50));
+    }
+
+    #[test]
+    fn prewrite_is_kept_after_a_single_higher_resolved_timestamp() {
+        let mut session = session(10);
+        let reg = register_one(&mut session, route(1, "", "~", 1));
+        live(&mut session, &reg, 40);
+        session.on_change_data(reg.stream, rows(&reg, vec![prewrite("a", 50)]));
+        session.on_change_data(reg.stream, resolved(&reg, 60));
         session.on_tick();
-        let actions = session.on_change_data(reg.stream, rows(&reg, vec![commit("w", 200, 400)]));
-        assert_eq!(deregistered(&actions), vec![1]);
+        assert!(holds(&session, "a", 50));
+    }
 
-        let again = register_one(&mut session, route(1, "", "~", 1));
-        assert_eq!(again.checkpoint, 299);
-        session.on_change_data(again.stream, rows(&again, vec![committed("w", 200, 400)]));
-        live(&mut session, &again, 500);
+    #[test]
+    fn prewrite_survives_a_resolved_timestamp_that_arrived_before_it() {
+        let mut session = session(10);
+        let (five, two) = two_regions_at(&mut session, 200);
+        session.on_change_data(five.stream, rows(&five, vec![prewrite("a", 50)]));
+        for ts in [250, 300] {
+            session.on_change_data(two.stream, resolved(&two, ts));
+            session.on_tick();
+        }
+        assert!(holds(&session, "a", 50));
+
+        session.on_change_data(five.stream, rows(&five, vec![commit("a", 50, 250)]));
+        session.on_change_data(five.stream, resolved(&five, 300));
         assert_eq!(
             keyed(&emitted(&session.on_tick())),
-            vec![(b"w".to_vec(), 400)]
+            vec![(b"a".to_vec(), 250)]
         );
+    }
+
+    #[test]
+    fn prewrite_survives_its_regions_reregistration_until_the_new_registration_resolves_past_it() {
+        let mut session = session(10);
+        let old = register_one(&mut session, route(1, "", "~", 1));
+        live(&mut session, &old, 100);
+        session.on_change_data(old.stream, rows(&old, vec![prewrite("a", 150)]));
+        session.on_change_data(old.stream, resolved(&old, 140));
+        session.on_change_data(old.stream, region_error(&old));
+
+        let new = register_one(&mut session, route(1, "", "~", 1));
+        session.on_change_data(
+            new.stream,
+            rows(&new, vec![prewrite("a", 150), initialized()]),
+        );
+        session.on_change_data(new.stream, resolved(&new, 160));
+        assert!(holds(&session, "a", 150));
+        session.on_change_data(new.stream, resolved(&new, 170));
+        assert!(!holds(&session, "a", 150));
     }
 
     #[test]

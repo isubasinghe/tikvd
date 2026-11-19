@@ -18,6 +18,12 @@ struct HeldPrewrite {
     value: Vec<u8>,
     old_value: Vec<u8>,
     op_type: i32,
+    first_resolved_after: Option<ResolvedBy>,
+}
+
+struct ResolvedBy {
+    registration: u64,
+    resolved_ts: u64,
 }
 
 #[derive(Default)]
@@ -50,6 +56,7 @@ impl Assembler {
                     value: row.value,
                     old_value: row.old_value,
                     op_type: row.op_type,
+                    first_resolved_after: None,
                 };
                 self.prewrites.insert((row.key, row.start_ts), held);
                 Ok(None)
@@ -80,9 +87,30 @@ impl Assembler {
                 .contains_key(&(row.key.clone(), row.start_ts))
     }
 
-    pub fn prune_prewrites_below(&mut self, watermark: u64) {
-        self.prewrites
-            .retain(|(_, start_ts), _| *start_ts >= watermark);
+    pub fn on_resolved_ts(
+        &mut self,
+        range: &(Vec<u8>, Vec<u8>),
+        registration: u64,
+        resolved_ts: u64,
+    ) {
+        let (start, end) = range;
+        self.prewrites.retain(|(key, start_ts), held| {
+            if key < start || key >= end {
+                return true;
+            }
+            match &held.first_resolved_after {
+                Some(first) if first.registration == registration => {
+                    resolved_ts <= *start_ts || resolved_ts <= first.resolved_ts
+                }
+                _ => {
+                    held.first_resolved_after = Some(ResolvedBy {
+                        registration,
+                        resolved_ts,
+                    });
+                    true
+                }
+            }
+        });
     }
 }
 
@@ -291,22 +319,73 @@ mod tests {
         assert_eq!(assembler.on_row(commit).unwrap(), None);
     }
 
+    fn held_prewrite(assembler: &mut Assembler, key: &[u8], start_ts: u64) {
+        let prewrite = with_values(
+            row(LogType::Prewrite, OpType::Put, key, start_ts, 0),
+            Some(&record(1, b"v")),
+            None,
+        );
+        assembler.on_row(prewrite).unwrap();
+    }
+
+    fn holds(assembler: &Assembler, key: &[u8], start_ts: u64) -> bool {
+        !assembler.is_unmatched_commit(&row(LogType::Commit, OpType::Put, key, start_ts, 99))
+    }
+
+    fn whole() -> (Vec<u8>, Vec<u8>) {
+        (b"k/".to_vec(), b"k0".to_vec())
+    }
+
     #[test]
-    fn prune_drops_only_prewrites_strictly_below_the_watermark() {
+    fn a_prewrite_is_dropped_by_a_second_resolved_ts_above_its_start_and_the_first() {
         let mut assembler = Assembler::new();
-        for start_ts in [5, 10, 15] {
-            let prewrite = with_values(
-                row(LogType::Prewrite, OpType::Put, b"a", start_ts, 0),
-                Some(&record(1, b"v")),
-                None,
-            );
-            assembler.on_row(prewrite).unwrap();
+        held_prewrite(&mut assembler, b"a", 50);
+        assembler.on_resolved_ts(&whole(), 1, 60);
+        assert!(holds(&assembler, b"a", 50));
+        assembler.on_resolved_ts(&whole(), 1, 70);
+        assert!(!holds(&assembler, b"a", 50));
+    }
+
+    #[test]
+    fn repeated_resolved_ts_above_a_late_prewrite_does_not_drop_it() {
+        let mut assembler = Assembler::new();
+        held_prewrite(&mut assembler, b"a", 50);
+        for _ in 0..10 {
+            assembler.on_resolved_ts(&whole(), 1, 100);
         }
-        assembler.prune_prewrites_below(10);
-        let commit = |start_ts| row(LogType::Commit, OpType::Put, b"a", start_ts, 20);
-        assert!(assembler.is_unmatched_commit(&commit(5)));
-        assert!(!assembler.is_unmatched_commit(&commit(10)));
-        assert!(!assembler.is_unmatched_commit(&commit(15)));
+        assert!(holds(&assembler, b"a", 50));
+    }
+
+    #[test]
+    fn a_resolved_ts_at_or_below_the_start_does_not_drop_a_prewrite() {
+        let mut assembler = Assembler::new();
+        held_prewrite(&mut assembler, b"a", 50);
+        assembler.on_resolved_ts(&whole(), 1, 40);
+        assembler.on_resolved_ts(&whole(), 1, 50);
+        assert!(holds(&assembler, b"a", 50));
+        assembler.on_resolved_ts(&whole(), 1, 51);
+        assert!(!holds(&assembler, b"a", 50));
+    }
+
+    #[test]
+    fn another_registration_restarts_the_count() {
+        let mut assembler = Assembler::new();
+        held_prewrite(&mut assembler, b"a", 50);
+        assembler.on_resolved_ts(&whole(), 1, 60);
+        assembler.on_resolved_ts(&whole(), 2, 70);
+        assert!(holds(&assembler, b"a", 50));
+        assembler.on_resolved_ts(&whole(), 2, 80);
+        assert!(!holds(&assembler, b"a", 50));
+    }
+
+    #[test]
+    fn a_resolved_ts_for_another_range_leaves_a_prewrite_alone() {
+        let mut assembler = Assembler::new();
+        held_prewrite(&mut assembler, b"z", 50);
+        let left = (keys::data_key(b"a"), keys::data_key(b"m"));
+        assembler.on_resolved_ts(&left, 1, 60);
+        assembler.on_resolved_ts(&left, 1, 70);
+        assert!(holds(&assembler, b"z", 50));
     }
 
     #[test]

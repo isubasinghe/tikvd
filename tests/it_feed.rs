@@ -262,6 +262,15 @@ impl RawTransaction {
 
 async fn prewrite_raw(store: &Store, raw_key: Vec<u8>, lock_ttl: u64) -> RawTransaction {
     let start_version = store.now().await.unwrap() as u64;
+    prewrite_raw_at(store, raw_key, start_version, lock_ttl).await
+}
+
+async fn prewrite_raw_at(
+    store: &Store,
+    raw_key: Vec<u8>,
+    start_version: u64,
+    lock_ttl: u64,
+) -> RawTransaction {
     let route = store
         .client()
         .regions_in_range(raw_key.clone()..[raw_key.as_slice(), &[0]].concat())
@@ -393,6 +402,50 @@ async fn live_transaction_is_not_rolled_back_by_cleanup() {
     let _alone = holding_the_watched_range_alone().await;
     let raw_key = data_key(&key(&unique_prefix(), "live"));
     let outcome = tokio::spawn(live_transaction_scenario(store.clone(), raw_key.clone())).await;
+    clean_lock(&store, raw_key).await;
+    if let Err(failure) = outcome {
+        std::panic::resume_unwind(failure.into_panic());
+    }
+}
+
+const ONE_SECOND_OF_TSO: u64 = 1000 << 18;
+
+async fn slow_transaction_scenario(store: Store, raw_key: Vec<u8>) {
+    let (mut feed, _health) = spawn_feed(store.clone(), FeedConfig::default());
+    let mut watermark = first_watermark(&mut feed).await;
+    for _ in 0..3 {
+        watermark = next_events(&mut feed, Instant::now() + Duration::from_secs(5))
+            .await
+            .1;
+    }
+
+    let start_version = watermark as u64 - ONE_SECOND_OF_TSO;
+    let began = std::time::Instant::now();
+    let mut txn = prewrite_raw_at(&store, raw_key.clone(), start_version, LIVE_LOCK_TTL_MS).await;
+    while began.elapsed() < Duration::from_secs(1) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        txn.heartbeat(began.elapsed().as_millis() as u64 + 2 * LIVE_LOCK_TTL_MS)
+            .await;
+    }
+    let commit_version = store.now().await.unwrap() as u64;
+    let response = txn.commit(commit_version).await;
+    assert!(response.region_error.is_none(), "{response:?}");
+    assert!(response.error.is_none(), "{response:?}");
+
+    let etcd_key = raw_key.strip_prefix(b"k/".as_slice()).unwrap();
+    let ours = collect_until(&mut feed, etcd_key, commit_version as i64, watermark).await;
+    let revisions: Vec<i64> = ours.iter().map(|e| e.revision).collect();
+    assert_eq!(revisions, vec![commit_version as i64]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn slow_transaction_is_delivered_without_reregistration() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let _alone = holding_the_watched_range_alone().await;
+    let raw_key = data_key(&key(&unique_prefix(), "slow"));
+    let outcome = tokio::spawn(slow_transaction_scenario(store.clone(), raw_key.clone())).await;
     clean_lock(&store, raw_key).await;
     if let Err(failure) = outcome {
         std::panic::resume_unwind(failure.into_panic());
