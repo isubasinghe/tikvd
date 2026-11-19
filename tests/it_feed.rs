@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tikv_client::proto::kvrpcpb::{Context, Mutation, Op, PrewriteRequest};
+use tikv_client::proto::kvrpcpb::{
+    CommitRequest, CommitResponse, Context, Mutation, Op, PrewriteRequest, TxnHeartBeatRequest,
+};
 use tikv_client::proto::tikvpb::tikv_client::TikvClient;
 use tikv_client::{Key, Timestamp, TimestampExt};
 use tikvd::cdc::ChangeEvent;
@@ -13,6 +15,7 @@ use tikvd::store::{Store, Write, WriteOutcome};
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::time::{Instant, timeout_at};
+use tonic::transport::Channel;
 
 static WATCHED_RANGE: RwLock<()> = RwLock::const_new(());
 
@@ -219,7 +222,45 @@ async fn serving_flips_true_after_first_watermark() {
     assert!(health.is_serving());
 }
 
-async fn leave_prewrite_lock(store: &Store, raw_key: Vec<u8>) -> i64 {
+struct RawTransaction {
+    tikv: TikvClient<Channel>,
+    context: Context,
+    key: Vec<u8>,
+    start_version: u64,
+}
+
+impl RawTransaction {
+    async fn heartbeat(&mut self, advise_lock_ttl: u64) {
+        let request = TxnHeartBeatRequest {
+            context: Some(self.context.clone()),
+            primary_lock: self.key.clone(),
+            start_version: self.start_version,
+            advise_lock_ttl,
+            ..Default::default()
+        };
+        let response = self
+            .tikv
+            .kv_txn_heart_beat(request)
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(response.region_error.is_none(), "{response:?}");
+        assert!(response.error.is_none(), "{response:?}");
+    }
+
+    async fn commit(&mut self, commit_version: u64) -> CommitResponse {
+        let request = CommitRequest {
+            context: Some(self.context.clone()),
+            start_version: self.start_version,
+            keys: vec![self.key.clone()],
+            commit_version,
+            ..Default::default()
+        };
+        self.tikv.kv_commit(request).await.unwrap().into_inner()
+    }
+}
+
+async fn prewrite_raw(store: &Store, raw_key: Vec<u8>, lock_ttl: u64) -> RawTransaction {
     let start_version = store.now().await.unwrap() as u64;
     let route = store
         .client()
@@ -237,29 +278,35 @@ async fn leave_prewrite_lock(store: &Store, raw_key: Vec<u8>) -> i64 {
         value: b"abandoned".to_vec(),
     }
     .encode();
+    let context = Context {
+        region_id: route.region.id,
+        region_epoch: route.region.region_epoch.clone(),
+        peer: Some(route.leader.clone()),
+        ..Default::default()
+    };
     let request = PrewriteRequest {
-        context: Some(Context {
-            region_id: route.region.id,
-            region_epoch: route.region.region_epoch.clone(),
-            peer: Some(route.leader.clone()),
-            ..Default::default()
-        }),
+        context: Some(context.clone()),
         mutations: vec![Mutation {
             op: Op::Put as i32,
             key: raw_key.clone(),
             value,
             ..Default::default()
         }],
-        primary_lock: raw_key,
+        primary_lock: raw_key.clone(),
         start_version,
-        lock_ttl: 60_000,
+        lock_ttl,
         txn_size: 1,
         ..Default::default()
     };
     let response = tikv.kv_prewrite(request).await.unwrap().into_inner();
     assert!(response.region_error.is_none(), "{response:?}");
     assert!(response.errors.is_empty(), "{response:?}");
-    start_version as i64
+    RawTransaction {
+        tikv,
+        context,
+        key: raw_key,
+        start_version,
+    }
 }
 
 async fn clean_lock(store: &Store, raw_key: Vec<u8>) {
@@ -275,7 +322,7 @@ async fn clean_lock(store: &Store, raw_key: Vec<u8>) {
 async fn abandoned_lock_scenario(store: Store, raw_key: Vec<u8>) {
     let (mut held, _health) = spawn_feed(store.clone(), with_threshold(Duration::from_secs(3600)));
     first_watermark(&mut held).await;
-    let lock_ts = leave_prewrite_lock(&store, raw_key).await;
+    let lock_ts = prewrite_raw(&store, raw_key, 1000).await.start_version as i64;
 
     let premise_until = Instant::now() + Duration::from_secs(5);
     loop {
@@ -305,6 +352,47 @@ async fn abandoned_lock_does_not_stall_forever() {
     let _alone = holding_the_watched_range_alone().await;
     let raw_key = data_key(&key(&unique_prefix(), "abandoned"));
     let outcome = tokio::spawn(abandoned_lock_scenario(store.clone(), raw_key.clone())).await;
+    clean_lock(&store, raw_key).await;
+    if let Err(failure) = outcome {
+        std::panic::resume_unwind(failure.into_panic());
+    }
+}
+
+async fn live_transaction_scenario(store: Store, raw_key: Vec<u8>) {
+    let (mut feed, _health) = spawn_feed(store.clone(), with_threshold(Duration::from_secs(1)));
+    let start = first_watermark(&mut feed).await;
+
+    let began = std::time::Instant::now();
+    let mut txn = prewrite_raw(&store, raw_key.clone(), LIVE_LOCK_TTL_MS).await;
+    while began.elapsed() < Duration::from_secs(3) {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let elapsed_ms = began.elapsed().as_millis() as u64;
+        txn.heartbeat(elapsed_ms + LIVE_LOCK_TTL_MS).await;
+    }
+    let commit_version = store.now().await.unwrap() as u64;
+    let response = txn.commit(commit_version).await;
+    assert!(response.region_error.is_none(), "{response:?}");
+    assert!(
+        response.error.is_none(),
+        "live transaction was rolled back: {response:?}"
+    );
+
+    let etcd_key = raw_key.strip_prefix(b"k/".as_slice()).unwrap();
+    let ours = collect_until(&mut feed, etcd_key, commit_version as i64, start).await;
+    let revisions: Vec<i64> = ours.iter().map(|e| e.revision).collect();
+    assert_eq!(revisions, vec![commit_version as i64]);
+}
+
+const LIVE_LOCK_TTL_MS: u64 = 1000;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_transaction_is_not_rolled_back_by_cleanup() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let _alone = holding_the_watched_range_alone().await;
+    let raw_key = data_key(&key(&unique_prefix(), "live"));
+    let outcome = tokio::spawn(live_transaction_scenario(store.clone(), raw_key.clone())).await;
     clean_lock(&store, raw_key).await;
     if let Err(failure) = outcome {
         std::panic::resume_unwind(failure.into_panic());

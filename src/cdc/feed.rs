@@ -4,8 +4,7 @@ use std::time::Duration;
 
 use tikv_client::proto::cdcpb::change_data_client::ChangeDataClient;
 use tikv_client::proto::cdcpb::{ChangeDataEvent, ChangeDataRequest};
-use tikv_client::transaction::ResolveLocksOptions;
-use tikv_client::{BoundRange, Key, RegionRoute, Timestamp, TimestampExt};
+use tikv_client::{Backoff, BoundRange, Key, RegionRoute, Timestamp, TimestampExt};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, MissedTickBehavior};
@@ -26,6 +25,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_MESSAGE_BYTES: usize = 512 << 20;
+const LOCK_SCAN_BATCH: u32 = 1024;
 
 #[derive(Debug, Clone)]
 pub struct FeedConfig {
@@ -355,15 +355,37 @@ async fn refresh_region_cache(store: &Store, range: &KeyRange) {
 }
 
 async fn clean_stalled_locks(store: &Store, range: &KeyRange, safepoint: u64) {
-    info!(safepoint, "cleaning up stalled locks");
-    let safepoint = Timestamp::from_version(safepoint);
-    if let Err(error) = store
-        .client()
-        .cleanup_locks(bound(range), &safepoint, ResolveLocksOptions::default())
-        .await
-    {
-        warn!(%error, "cleaning up stalled locks failed");
+    if let Err(error) = resolve_expired_locks(store, range, safepoint).await {
+        warn!(%error, "resolving stalled locks failed");
     }
+}
+
+async fn resolve_expired_locks(
+    store: &Store,
+    range: &KeyRange,
+    safepoint: u64,
+) -> Result<(), tikv_client::Error> {
+    let safepoint = Timestamp::from_version(safepoint);
+    let locks = store
+        .client()
+        .scan_locks(&safepoint, bound(range), LOCK_SCAN_BATCH)
+        .await?;
+    if locks.is_empty() {
+        return Ok(());
+    }
+    info!(
+        locks = locks.len(),
+        "resolving stalled locks whose TTL has expired"
+    );
+    let live = store
+        .client()
+        .resolve_locks(locks, safepoint, Backoff::no_backoff())
+        .await?;
+    debug!(
+        live = live.len(),
+        "stalled locks still held by live transactions"
+    );
+    Ok(())
 }
 
 async fn read_stream(
