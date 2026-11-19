@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tikv_client::TransactionOptions;
-use tikvd::keys::{parse_ttl_key, ttl_range_until};
+use tikvd::keys::{data_key, parse_ttl_key, ttl_range_until};
 use tikvd::store::{Compare, KeyValue, RangeQuery, Store, StoreError, Write, WriteOutcome};
 
 async fn test_store() -> Option<Store> {
@@ -699,6 +699,39 @@ async fn compact_rejects_non_positive_revision() {
         store.compact(-1).await,
         Err(StoreError::Compacted)
     ));
+}
+
+async fn locks_left_on(store: &Store, raw_key: &[u8]) -> usize {
+    let now = store.client().current_timestamp().await.unwrap();
+    let end = [raw_key, &[0]].concat();
+    store
+        .client()
+        .scan_locks(&now, raw_key.to_vec()..end, 16)
+        .await
+        .unwrap()
+        .len()
+}
+
+#[tokio::test]
+async fn a_leased_write_has_committed_its_data_key_when_it_returns() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let k = key(&unique_prefix(), "leased");
+    let mut data_key_still_locked = 0;
+    for n in 0..40 {
+        let write = if n % 4 == 3 {
+            Write::Delete
+        } else {
+            ttl_put("v", 3600 + n)
+        };
+        applied(&store, &k, None, write).await;
+        data_key_still_locked += locks_left_on(&store, &data_key(&k)).await;
+    }
+    assert_eq!(
+        data_key_still_locked, 0,
+        "the data key was a secondary committed after the write returned"
+    );
 }
 
 #[tokio::test]

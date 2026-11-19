@@ -289,8 +289,8 @@ impl Store {
         match write {
             Write::Put { value, ttl_secs } => {
                 let record = next_record(prev_record, value, *ttl_secs, txn.start_timestamp());
-                stage_ttl_index(&mut txn, key, prev_record, record.lease_expiry).await?;
                 txn.put(data_key(key), record.encode()).await?;
+                stage_ttl_index(&mut txn, key, prev_record, record.lease_expiry).await?;
             }
             Write::Delete if current.is_none() => {
                 return Ok(Attempt::Done(WriteOutcome::Applied {
@@ -461,9 +461,8 @@ async fn stage_delete(
     key: &[u8],
     prev: Option<&Record>,
 ) -> Result<(), StoreError> {
-    stage_ttl_index(txn, key, prev, 0).await?;
     txn.delete(data_key(key)).await?;
-    Ok(())
+    stage_ttl_index(txn, key, prev, 0).await
 }
 
 async fn commit_unless_conflicted(txn: &mut Transaction) -> Result<Option<i64>, StoreError> {
