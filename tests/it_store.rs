@@ -395,6 +395,59 @@ async fn range_larger_than_a_default_grpc_message() {
     assert!(result.kvs.iter().all(|kv| kv.value == value));
 }
 
+async fn write_mebibyte_values(store: &Store, prefix: &[u8], count: usize) -> Vec<(Vec<u8>, i64)> {
+    let mut written = Vec::new();
+    for n in 0..count {
+        let name = key(prefix, &format!("{n:03}"));
+        let write = Write::Put {
+            value: vec![n as u8; 1024 * 1024],
+            ttl_secs: None,
+        };
+        let revision = applied(store, &name, None, write).await;
+        written.push((name, revision));
+    }
+    written
+}
+
+#[tokio::test]
+async fn range_larger_than_tikvs_response_cap() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let prefix = unique_prefix();
+    let written = write_mebibyte_values(&store, &prefix, 24).await;
+
+    let result = store.range(prefix_query(&prefix)).await.unwrap();
+    assert_eq!(result.kvs.len(), written.len());
+    for (n, (kv, (name, revision))) in result.kvs.iter().zip(&written).enumerate() {
+        assert_eq!(&kv.key, name);
+        assert_eq!(kv.mod_revision, *revision);
+        assert_eq!(kv.value, vec![n as u8; 1024 * 1024]);
+    }
+}
+
+#[tokio::test]
+async fn delete_range_larger_than_tikvs_response_cap() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let prefix = unique_prefix();
+    write_mebibyte_values(&store, &prefix, 24).await;
+    let mut range_end = prefix.clone();
+    *range_end.last_mut().unwrap() += 1;
+
+    let (deleted, _) = store.delete_range(&prefix, &range_end).await.unwrap();
+    assert_eq!(deleted, 24);
+    assert!(
+        store
+            .range(prefix_query(&prefix))
+            .await
+            .unwrap()
+            .kvs
+            .is_empty()
+    );
+}
+
 #[tokio::test]
 async fn count_only() {
     let Some(store) = test_store().await else {
