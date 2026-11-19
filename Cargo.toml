@@ -13,6 +13,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 tonic-health = "0.12"
+http = "1"
+http-body = "1"
+tower-layer = "0.3"
+tower-service = "0.3"
 
 [build-dependencies]
 tonic-build = "0.12"

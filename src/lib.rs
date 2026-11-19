@@ -7,5 +7,6 @@ pub mod pb;
 pub mod record;
 pub mod server;
 pub mod store;
+pub mod unimplemented_log;
 pub mod watch_hub;
 pub mod watch_service;

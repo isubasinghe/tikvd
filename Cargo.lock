@@ -1598,6 +1598,8 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "etcd-client",
+ "http",
+ "http-body",
  "prost",
  "rcgen",
  "tikv-client",
@@ -1605,6 +1607,8 @@ dependencies = [
  "tonic",
  "tonic-build",
  "tonic-health",
+ "tower-layer",
+ "tower-service",
  "tracing",
  "tracing-subscriber",
 ]

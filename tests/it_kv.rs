@@ -246,3 +246,12 @@ fn status_code(error: &Error) -> Code {
         other => panic!("expected a gRPC status, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn a_call_to_an_unregistered_service_is_unimplemented() {
+    let Some((mut client, _)) = start_tikvd().await else {
+        return;
+    };
+    let error = client.member_list().await.expect_err("rejected");
+    assert_eq!(status_code(&error), Code::Unimplemented);
+}

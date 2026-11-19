@@ -22,6 +22,7 @@ use crate::pb::etcdserverpb::lease_server::LeaseServer;
 use crate::pb::etcdserverpb::maintenance_server::MaintenanceServer;
 use crate::pb::etcdserverpb::watch_server::WatchServer;
 use crate::store::Store;
+use crate::unimplemented_log::UnimplementedLogLayer;
 use crate::watch_hub::WatchHub;
 use crate::watch_service::WatchService;
 
@@ -57,7 +58,8 @@ pub async fn serve_listener(
     let mut builder = match &config.tls {
         Some((cert, key)) => Server::builder().tls_config(server_tls(cert, key)?)?,
         None => Server::builder(),
-    };
+    }
+    .layer(UnimplementedLogLayer);
     let store = Store::connect(config.pd_endpoints).await?;
     let incoming = TcpIncoming::from_listener(listener, true, None)?;
     let (feed, feed_health) = spawn_feed(store.clone(), FeedConfig::default());
