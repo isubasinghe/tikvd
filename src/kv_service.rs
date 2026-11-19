@@ -193,12 +193,7 @@ impl Kv for KvService {
 
     async fn txn(&self, request: Request<TxnRequest>) -> Result<Response<TxnResponse>, Status> {
         let request = request.into_inner();
-        debug!(
-            rpc = "txn",
-            compares = request.compare.len(),
-            success_ops = request.success.len(),
-            failure_ops = request.failure.len(),
-        );
+        debug!(rpc = "txn", shape = %txn_shape(&request));
         Ok(Response::new(self.txn_response(&request).await?))
     }
 
@@ -407,7 +402,7 @@ fn require_key(key: &[u8]) -> Result<(), Status> {
 }
 
 pub(crate) fn unsupported(shape: &str) -> Status {
-    warn!(shape, "unsupported request");
+    warn!(shape, "returning UNIMPLEMENTED for an unsupported request");
     Status::unimplemented(format!("unsupported: {shape}"))
 }
 
@@ -442,6 +437,59 @@ fn to_proto(kv: store::KeyValue) -> mvccpb::KeyValue {
 
 fn show(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+fn txn_shape(request: &TxnRequest) -> String {
+    let compares: Vec<String> = request.compare.iter().map(compare_shape).collect();
+    let ops = |ops: &[RequestOp]| ops.iter().map(op_shape).collect::<Vec<_>>().join(",");
+    format!(
+        "if [{}] then [{}] else [{}]",
+        compares.join(","),
+        ops(&request.success),
+        ops(&request.failure)
+    )
+}
+
+fn compare_shape(compare: &crate::pb::etcdserverpb::Compare) -> String {
+    let target = match compare.target_union {
+        Some(compare::TargetUnion::ModRevision(revision)) => format!("mod={revision}"),
+        Some(compare::TargetUnion::Version(version)) => format!("version={version}"),
+        Some(compare::TargetUnion::CreateRevision(revision)) => format!("create={revision}"),
+        Some(compare::TargetUnion::Value(_)) => "value".to_owned(),
+        Some(compare::TargetUnion::Lease(lease)) => format!("lease={lease}"),
+        None => "none".to_owned(),
+    };
+    format!(
+        "{} target={} result={} range_end={}",
+        show(&compare.key),
+        target,
+        compare.result,
+        show(&compare.range_end)
+    )
+}
+
+fn op_shape(op: &RequestOp) -> String {
+    match &op.request {
+        Some(request_op::Request::RequestPut(put)) => format!(
+            "put(lease={},prev_kv={},ignore_value={},ignore_lease={})",
+            put.lease, put.prev_kv, put.ignore_value, put.ignore_lease
+        ),
+        Some(request_op::Request::RequestDeleteRange(delete)) => format!(
+            "delete(range_end={},prev_kv={})",
+            show(&delete.range_end),
+            delete.prev_kv
+        ),
+        Some(request_op::Request::RequestRange(range)) => format!(
+            "range(range_end={},limit={},revision={},keys_only={},count_only={})",
+            show(&range.range_end),
+            range.limit,
+            range.revision,
+            range.keys_only,
+            range.count_only
+        ),
+        Some(request_op::Request::RequestTxn(_)) => "txn".to_owned(),
+        None => "none".to_owned(),
+    }
 }
 
 #[cfg(test)]

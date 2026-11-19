@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use tonic::codegen::BoxStream;
 use tonic::{Request, Response, Status};
+use tracing::debug;
 
 use crate::kv_service::{MEMBER_ID, RAFT_TERM, header, unsupported};
 use crate::pb::etcdserverpb::maintenance_server::Maintenance;
@@ -32,6 +33,7 @@ impl Maintenance for MaintenanceService {
         &self,
         _request: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
+        debug!(rpc = "status");
         Ok(Response::new(StatusResponse {
             header: Some(header(self.hub.watermark())),
             version: ETCD_VERSION.to_owned(),
