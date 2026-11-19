@@ -122,6 +122,11 @@ but not observed.
    it holds. Other tags, including v8.5.1 to v8.5.3, v8.5.7 and
    everything before v7.5.8, were not tested.
    From source: `BatchGet` accepts the flag too and `Scan` does not.
+6. `Transaction::commit` in `tikv-client` 0.4.0 returns `Some` commit
+   timestamp for one-phase and two-phase commits. From source: it does not
+   set `need_commit_ts`, does not expose CDC, and keeps its protobuf types
+   and PD/region client private. Its default `prometheus` feature needs a
+   system OpenSSL to build.
 7. From source: TiKV does not publish a resolved timestamp for a region
    whose range has shrunk (by a split or merge) before it sends that
    region's error to its CDC subscribers. The feed's safety relies on
@@ -133,11 +138,6 @@ but not observed.
    why lock cleanup scoped to the `k/` range is enough. On a TiKV version
    that tracked locks region-wide, such a lock would instead stall every
    instance's watermark until something else resolved it.
-6. `Transaction::commit` in `tikv-client` 0.4.0 returns `Some` commit
-   timestamp for one-phase and two-phase commits. From source: it does not
-   set `need_commit_ts`, does not expose CDC, and keeps its protobuf types
-   and PD/region client private. Its default `prometheus` feature needs a
-   system OpenSSL to build.
 
 ## Assumptions
 
@@ -296,6 +296,8 @@ A client watch with start revision R:
 - R is 0: fetch a timestamp T from PD and deliver events above T.
 - R older than the window, or older than the instance's start: fail the
   watch with etcd's compacted error. kube-apiserver responds by relisting.
+- R within the window, but the replay from R would exceed the per-watcher
+  queue bound: fail the watch with etcd's compacted error.
 
 Progress notifications and `WatchProgressRequest` report the watermark.
 
@@ -385,6 +387,51 @@ repo this way.)
   either queue bound is cancelled.
 - A watch whose replay from the window would exceed the per-watcher
   bound is told to relist (cancelled as compacted).
+
+## Conformance
+
+Run on 2026-11-19 by `CONFORMANCE=focus|full dev/acceptance.sh`: k3s
+v1.36.2+k3s1 (one server, two agents) against two `tikvd` instances on
+one PD and one TiKV v8.5.6, Hydrophone v0.8.0, image
+`registry.k8s.io/conformance:v1.36.2`, 16 Ginkgo processes, `[Serial]`
+specs run alone at the end. The baseline (`CONFORMANCE_BASELINE=1`) is
+the same cluster shape on k3s's default datastore, Kine on SQLite.
+
+- Focus, `[sig-api-machinery].*[Conformance]`, 12 min: 96 passed, 3
+  failed, 7480 skipped.
+- Full, `[Conformance]`, 32 min: 439 passed, 7 failed, 7133 skipped.
+  Baseline full, 29 min: 446 passed, 0 failed, 7133 skipped.
+- Gates after each run: no `UNIMPLEMENTED`, no feed reset, cache
+  consistency asserted (190 checks focus, 486 full, none failed).
+
+Every failed test passed on the baseline, both alone and in its full
+run. Run counts below are over the focus run, the full run and the
+re-runs of failed tests on `tikvd`.
+
+- AdmissionWebhook should honor timeout: caused by `tikvd`, watch lag;
+  failed 4 of 4. The test deletes and recreates a webhook configuration
+  of the same name 12 ms apart, and kube-apiserver still applied the
+  deleted one.
+- CustomResourcePublishOpenAPI, works for multiple CRDs of different
+  groups (2 of 3), of same group and version but different kinds (3 of
+  4), of same group but different versions (1 of 3);
+  CustomResourceDefinition creating/deleting (1 of 3): caused by `tikvd`,
+  watch lag. The CRD finalizer's retry read its stale lister, got a
+  conflict and dropped the key; the CRD was removed at the finalizer's
+  five-minute resync, after the test's 30 s wait.
+- NoExecuteTaintManager removing taint cancels eviction: caused by
+  `tikvd`, watch lag; failed 2 of 2. The test reads the node at
+  `resourceVersion=0` from the watch cache 3 ms after confirming the
+  taint, finds no taint and skips the removal.
+- OrderedNamespaceDeletion namespace deletion should delete pod first:
+  caused by `tikvd`; failed 1 of 3, only under full-suite load. The
+  namespace controller first acted 2 min 18 s after the delete and
+  deleted the namespace 7 min after its last pod went. Mean namespace
+  queue wait was 330 s against 209 s on the baseline; mean write latency
+  seen by kube-apiserver was 14 to 22 ms against 1.5 to 2.5 ms.
+- ControllerRevision should manage the lifecycle of a ControllerRevision:
+  caused by `tikvd`; failed 1 of 2. The DaemonSet controller deleted the
+  revision the test then tried to delete, 19 ms earlier.
 
 ## Order of work
 
