@@ -187,6 +187,33 @@ async fn progress_request_returns_watermark_header() {
 }
 
 #[tokio::test]
+async fn progress_after_list_is_not_below_the_list_revision() {
+    let Some((mut client, _)) = start_tikvd().await else {
+        return;
+    };
+    let prefix = unique_prefix("it-watch");
+    wait_until_serving_watches(&mut client, &prefix).await;
+
+    let listed = client.get(format!("{prefix}a"), None).await.unwrap();
+    let r = revision_of(listed.header());
+    let (mut watcher, mut stream) = watch_prefix(
+        &mut client,
+        &prefix,
+        WatchOptions::new().with_start_revision(r + 1),
+    )
+    .await;
+    watcher.request_progress().await.unwrap();
+
+    let progress = next_response(&mut stream, Instant::now() + DEADLINE).await;
+    assert!(progress.events().is_empty());
+    let reported = revision_of(progress.header());
+    assert!(
+        reported >= r,
+        "progress {reported} is below the list at {r}"
+    );
+}
+
+#[tokio::test]
 async fn watch_from_ancient_revision_is_cancelled_compacted() {
     let Some((mut client, _)) = start_tikvd().await else {
         return;

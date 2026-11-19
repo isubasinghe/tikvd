@@ -10,7 +10,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::cdc::ChangeEvent;
 use crate::kv_service::{header, unsupported};
@@ -153,36 +153,48 @@ impl WatchStreamState {
             _ = self.out.closed() => return Ok(()),
         }
         let after_revision = match create.start_revision {
-            0 => self
-                .store
-                .now()
-                .await
-                .map_err(|error| Status::unavailable(error.to_string()))?,
+            0 => match self.store.now().await {
+                Ok(now) => now,
+                Err(error) => {
+                    warn!(watch_id, %error, "watch create failed");
+                    self.send(WatchResponse {
+                        header: Some(header(self.hub.watermark())),
+                        watch_id,
+                        created: true,
+                        canceled: true,
+                        cancel_reason: error.to_string(),
+                        ..Default::default()
+                    })
+                    .await;
+                    return Ok(());
+                }
+            },
             start => start - 1,
         };
         let subscribed = self
             .hub
             .subscribe(create.key, create.range_end, after_revision);
-        let watermark = self.hub.watermark();
+        let start_point = created_revision(after_revision, self.hub.watermark());
         self.send(WatchResponse {
-            header: Some(header(watermark)),
+            header: Some(header(start_point)),
             watch_id,
             created: true,
             ..Default::default()
         })
         .await;
         let Ok(subscription) = subscribed else {
-            self.send(compacted_response(watch_id, watermark, &self.hub))
+            self.send(compacted_response(watch_id, start_point, &self.hub))
                 .await;
             return Ok(());
         };
-        let delivered = Arc::new(AtomicI64::new(after_revision.min(watermark)));
+        let delivered = Arc::new(AtomicI64::new(after_revision));
         let forwarder = Forwarder {
             watch_id,
             prev_kv: create.prev_kv,
             progress_notify: create.progress_notify,
             out: self.out.clone(),
             hub: self.hub.clone(),
+            progress: WatchProgress::starting_after(after_revision),
             delivered: delivered.clone(),
         };
         self.watches.insert(
@@ -228,13 +240,12 @@ impl WatchStreamState {
     }
 
     async fn progress(&self) {
-        let revision = self
+        let reported = self
             .watches
             .values()
             .filter(|watch| !watch.forwarder.is_finished())
-            .map(|watch| watch.delivered.load(Ordering::SeqCst))
-            .min()
-            .unwrap_or_else(|| self.hub.watermark());
+            .map(|watch| watch.delivered.load(Ordering::SeqCst));
+        let revision = stream_progress(reported, self.hub.watermark());
         self.send(progress_response(STREAM_WIDE_WATCH_ID, revision))
             .await;
     }
@@ -250,17 +261,18 @@ struct Forwarder {
     progress_notify: bool,
     out: Outbound,
     hub: Arc<WatchHub>,
+    progress: WatchProgress,
     delivered: Arc<AtomicI64>,
 }
 
 impl Forwarder {
-    async fn run(self, mut subscription: Subscription) {
+    async fn run(mut self, mut subscription: Subscription) {
         let mut last_sent = Instant::now();
         loop {
             let delivery = tokio::select! {
                 delivery = subscription.next() => delivery,
                 _ = sleep_until(last_sent + PROGRESS_INTERVAL), if self.progress_notify => {
-                    let revision = self.delivered.load(Ordering::SeqCst);
+                    let revision = self.progress.reported();
                     if !self.send(progress_response(self.watch_id, revision)).await {
                         return;
                     }
@@ -270,17 +282,19 @@ impl Forwarder {
             };
             match delivery {
                 Delivery::Events { events, watermark } => {
-                    if !self.send(self.events_response(events, watermark)).await {
+                    let revision = self.progress.advance(watermark);
+                    if !self.send(self.events_response(events, revision)).await {
                         return;
                     }
-                    self.delivered.store(watermark, Ordering::SeqCst);
+                    self.delivered.store(revision, Ordering::SeqCst);
                     last_sent = Instant::now();
                 }
                 Delivery::Progress { watermark } => {
-                    self.delivered.store(watermark, Ordering::SeqCst);
+                    let revision = self.progress.advance(watermark);
+                    self.delivered.store(revision, Ordering::SeqCst);
                 }
                 Delivery::Cancelled { compacted } => {
-                    let revision = self.delivered.load(Ordering::SeqCst);
+                    let revision = self.progress.reported();
                     let response = if compacted {
                         compacted_response(self.watch_id, revision, &self.hub)
                     } else {
@@ -299,9 +313,9 @@ impl Forwarder {
         }
     }
 
-    fn events_response(&self, events: Vec<ChangeEvent>, watermark: i64) -> WatchResponse {
+    fn events_response(&self, events: Vec<ChangeEvent>, revision: i64) -> WatchResponse {
         WatchResponse {
-            header: Some(header(watermark)),
+            header: Some(header(revision)),
             watch_id: self.watch_id,
             events: events
                 .into_iter()
@@ -386,4 +400,93 @@ fn key_value(
 
 fn show(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+struct WatchProgress {
+    reported: i64,
+}
+
+impl WatchProgress {
+    fn starting_after(after_revision: i64) -> WatchProgress {
+        WatchProgress {
+            reported: after_revision,
+        }
+    }
+
+    fn advance(&mut self, watermark: i64) -> i64 {
+        self.reported = self.reported.max(watermark);
+        self.reported
+    }
+
+    fn reported(&self) -> i64 {
+        self.reported
+    }
+}
+
+fn created_revision(after_revision: i64, watermark: i64) -> i64 {
+    after_revision.max(watermark)
+}
+
+fn stream_progress(reported: impl Iterator<Item = i64>, watermark: i64) -> i64 {
+    reported.min().unwrap_or(watermark)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_is_never_below_the_watch_start() {
+        let mut progress = WatchProgress::starting_after(105);
+        assert!(progress.reported() >= 105);
+        assert!(progress.advance(102) >= 105);
+        assert!(progress.advance(104) >= 105);
+        assert!(progress.reported() >= 105);
+        assert_eq!(progress.advance(110), 110);
+    }
+
+    #[test]
+    fn reported_revision_never_decreases() {
+        let mut progress = WatchProgress::starting_after(10);
+        let mut last = progress.reported();
+        for watermark in [12, 30, 20, 30, 25, 40, 5] {
+            let reported = progress.advance(watermark);
+            assert!(reported >= last, "{reported} after {last}");
+            last = reported;
+        }
+        assert_eq!(last, 40);
+    }
+
+    #[test]
+    fn stream_progress_is_the_minimum_over_watches_each_clamped_to_its_start() {
+        let mut late = WatchProgress::starting_after(105);
+        let mut early = WatchProgress::starting_after(50);
+        late.advance(100);
+        early.advance(100);
+        assert_eq!(
+            stream_progress([late.reported(), early.reported()].into_iter(), 100),
+            100
+        );
+        late.advance(120);
+        early.advance(120);
+        assert_eq!(
+            stream_progress([late.reported(), early.reported()].into_iter(), 120),
+            120
+        );
+        assert_eq!(stream_progress(std::iter::empty(), 120), 120);
+    }
+
+    #[test]
+    fn created_header_is_the_start_point_for_a_revision_zero_watch() {
+        let now = 130;
+        assert_eq!(created_revision(now, 100), 130);
+        assert_eq!(created_revision(40, 100), 100);
+    }
+
+    #[test]
+    fn events_header_is_not_below_the_watch_start() {
+        let mut progress = WatchProgress::starting_after(105);
+        assert_eq!(progress.advance(103), 105);
+        assert_eq!(progress.advance(108), 108);
+    }
 }
