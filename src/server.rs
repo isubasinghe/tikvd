@@ -27,7 +27,9 @@ use crate::watch_hub::WatchHub;
 use crate::watch_service::WatchService;
 
 const WATCH_WINDOW_EVENTS: usize = 100_000;
+const WATCH_WINDOW_BYTES: usize = 256 << 20;
 const WATCH_SUBSCRIBER_BUFFER: usize = 1024;
+const WATCH_SUBSCRIBER_BYTES: usize = 64 << 20;
 const HEALTH_INTERVAL: Duration = Duration::from_secs(1);
 const HEALTH_SERVICES: [&str; 2] = ["", "etcdserverpb.Maintenance"];
 
@@ -65,7 +67,12 @@ pub async fn serve_listener(
     let (feed, feed_health) = spawn_feed(store.clone(), FeedConfig::default());
     let state = ServerState {
         store,
-        hub: WatchHub::new(WATCH_WINDOW_EVENTS, WATCH_SUBSCRIBER_BUFFER),
+        hub: WatchHub::new(
+            WATCH_WINDOW_EVENTS,
+            WATCH_WINDOW_BYTES,
+            WATCH_SUBSCRIBER_BUFFER,
+            WATCH_SUBSCRIBER_BYTES,
+        ),
         feed_health,
     };
     let (mut health_reporter, health_service) = health_reporter();

@@ -14,6 +14,13 @@ pub struct ChangeEvent {
     pub previous: Option<Record>,
 }
 
+impl ChangeEvent {
+    pub fn size_bytes(&self) -> usize {
+        let value_len = |record: &Option<Record>| record.as_ref().map_or(0, |r| r.value.len());
+        self.key.len() + value_len(&self.current) + value_len(&self.previous)
+    }
+}
+
 struct HeldPrewrite {
     value: Vec<u8>,
     old_value: Vec<u8>,

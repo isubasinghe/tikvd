@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::assemble::ChangeEvent;
-use crate::record::Record;
 
 #[derive(Debug, PartialEq)]
 pub struct SorterFull;
@@ -49,7 +48,7 @@ impl Sorter {
         if self.held.contains_key(&id) {
             return Ok(());
         }
-        let size = event_size(&event);
+        let size = event.size_bytes();
         if self.memory_used_bytes + size > self.memory_limit_bytes {
             return Err(SorterFull);
         }
@@ -66,7 +65,7 @@ impl Sorter {
             .split_off(&(watermark.saturating_add(1), Vec::new()));
         let released = std::mem::replace(&mut self.held, kept);
         let events: Vec<ChangeEvent> = released.into_values().collect();
-        let released_bytes: usize = events.iter().map(event_size).sum();
+        let released_bytes: usize = events.iter().map(ChangeEvent::size_bytes).sum();
         self.memory_used_bytes -= released_bytes;
         (events, watermark)
     }
@@ -78,11 +77,6 @@ impl Sorter {
             .min()
             .unwrap_or(0)
     }
-}
-
-fn event_size(event: &ChangeEvent) -> usize {
-    let value_len = |record: &Option<Record>| record.as_ref().map_or(0, |r| r.value.len());
-    event.key.len() + value_len(&event.current) + value_len(&event.previous)
 }
 
 #[cfg(test)]

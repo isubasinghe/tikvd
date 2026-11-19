@@ -34,7 +34,9 @@ pub struct WatchHub {
 #[derive(Clone, Copy)]
 struct Limits {
     window_events: usize,
+    window_bytes: usize,
     subscriber_buffer: usize,
+    subscriber_bytes: usize,
     batch_events: usize,
 }
 
@@ -43,6 +45,7 @@ struct HubState {
     watermark: i64,
     floor: Option<i64>,
     window: VecDeque<ChangeEvent>,
+    window_bytes: usize,
     subscribers: Vec<Subscriber>,
 }
 
@@ -60,6 +63,7 @@ struct Queue {
 
 struct QueueState {
     batches: VecDeque<Batch>,
+    bytes: usize,
     watermark: i64,
     cancelled: Option<bool>,
 }
@@ -69,19 +73,38 @@ struct Batch {
     watermark: i64,
 }
 
+impl Batch {
+    fn size_bytes(&self) -> usize {
+        self.events.iter().map(ChangeEvent::size_bytes).sum()
+    }
+}
+
 pub struct Subscription {
     queue: Arc<Queue>,
     reported: i64,
 }
 
 impl WatchHub {
-    pub fn new(window_events: usize, subscriber_buffer: usize) -> Arc<WatchHub> {
-        Self::with_batch_limit(window_events, subscriber_buffer, BATCH_EVENTS)
+    pub fn new(
+        window_events: usize,
+        window_bytes: usize,
+        subscriber_buffer: usize,
+        subscriber_bytes: usize,
+    ) -> Arc<WatchHub> {
+        Self::with_batch_limit(
+            window_events,
+            window_bytes,
+            subscriber_buffer,
+            subscriber_bytes,
+            BATCH_EVENTS,
+        )
     }
 
     fn with_batch_limit(
         window_events: usize,
+        window_bytes: usize,
         subscriber_buffer: usize,
+        subscriber_bytes: usize,
         batch_events: usize,
     ) -> Arc<WatchHub> {
         Arc::new(WatchHub {
@@ -89,7 +112,9 @@ impl WatchHub {
             ready: watch::Sender::new(false),
             limits: Limits {
                 window_events,
+                window_bytes,
                 subscriber_buffer,
+                subscriber_bytes,
                 batch_events,
             },
         })
@@ -153,8 +178,9 @@ impl WatchHub {
         state.subscribers.retain(|subscriber| {
             subscriber.is_held() && subscriber.offer(events.iter(), watermark, limits)
         });
+        state.window_bytes += events.iter().map(ChangeEvent::size_bytes).sum::<usize>();
         state.window.extend(events);
-        state.evict_beyond(limits.window_events);
+        state.evict_beyond(limits);
         state.watermark = watermark;
         drop(state);
         self.ready
@@ -167,6 +193,7 @@ impl WatchHub {
             subscriber.queue.cancel(true);
         }
         state.window.clear();
+        state.window_bytes = 0;
         state.floor = None;
         drop(state);
         self.ready.send_replace(false);
@@ -174,17 +201,13 @@ impl WatchHub {
 }
 
 impl HubState {
-    fn evict_beyond(&mut self, window_events: usize) {
-        while self.window.len() > window_events {
+    fn evict_beyond(&mut self, limits: Limits) {
+        while self.window.len() > limits.window_events || self.window_bytes > limits.window_bytes {
             let Some(oldest) = self.window.front().map(|event| event.revision) else {
                 return;
             };
-            while self
-                .window
-                .front()
-                .is_some_and(|event| event.revision == oldest)
-            {
-                self.window.pop_front();
+            while let Some(event) = self.window.pop_front_if(|event| event.revision == oldest) {
+                self.window_bytes -= event.size_bytes();
             }
             self.floor = self.floor.max(Some(oldest));
         }
@@ -219,7 +242,7 @@ impl Subscriber {
         self.queue.push(
             split_between_revisions(&wanted, watermark, limits.batch_events),
             watermark,
-            limits.subscriber_buffer,
+            limits,
         )
     }
 }
@@ -257,6 +280,7 @@ impl Queue {
         Queue {
             state: Mutex::new(QueueState {
                 batches: VecDeque::new(),
+                bytes: 0,
                 watermark,
                 cancelled: None,
             }),
@@ -264,13 +288,17 @@ impl Queue {
         }
     }
 
-    fn push(&self, batches: Vec<Batch>, watermark: i64, capacity: usize) -> bool {
+    fn push(&self, batches: Vec<Batch>, watermark: i64, limits: Limits) -> bool {
         let mut state = self.state.lock().unwrap();
-        if state.batches.len() + batches.len() > capacity {
+        let bytes = state.bytes + batches.iter().map(Batch::size_bytes).sum::<usize>();
+        if state.batches.len() + batches.len() > limits.subscriber_buffer
+            || bytes > limits.subscriber_bytes
+        {
             drop(state);
             self.cancel(false);
             return false;
         }
+        state.bytes = bytes;
         state.batches.extend(batches);
         state.watermark = watermark;
         drop(state);
@@ -281,6 +309,7 @@ impl Queue {
     fn cancel(&self, compacted: bool) {
         let mut state = self.state.lock().unwrap();
         state.batches.clear();
+        state.bytes = 0;
         state.cancelled = Some(compacted);
         drop(state);
         self.notify.notify_one();
@@ -303,6 +332,7 @@ impl Subscription {
             return Some(Delivery::Cancelled { compacted });
         }
         if let Some(batch) = state.batches.pop_front() {
+            state.bytes -= batch.size_bytes();
             self.reported = batch.watermark;
             return Some(Delivery::Events {
                 events: batch.events,
@@ -338,6 +368,17 @@ mod tests {
             }),
             previous: None,
         }
+    }
+
+    fn sized(key: &str, revision: i64, bytes: usize) -> ChangeEvent {
+        let mut event = put(key, revision);
+        let value_len = bytes - key.len();
+        event.current.as_mut().unwrap().value = vec![b'v'; value_len];
+        event
+    }
+
+    fn unbounded_bytes(window_events: usize, subscriber_buffer: usize) -> Arc<WatchHub> {
+        WatchHub::new(window_events, usize::MAX, subscriber_buffer, usize::MAX)
     }
 
     fn events(events: Vec<ChangeEvent>, watermark: i64) -> FeedOutput {
@@ -390,7 +431,7 @@ mod tests {
 
     #[tokio::test]
     async fn replays_window_then_follows_live() {
-        let hub = WatchHub::new(100, 16);
+        let hub = unbounded_bytes(100, 16);
         hub.apply(events(vec![], 5));
         hub.apply(events(vec![put("a/1", 10), put("a/2", 20)], 25));
         let (key, end) = everything();
@@ -403,7 +444,7 @@ mod tests {
 
     #[tokio::test]
     async fn future_revision_waits() {
-        let hub = WatchHub::new(100, 16);
+        let hub = unbounded_bytes(100, 16);
         hub.apply(events(vec![], 10));
         let (key, end) = everything();
         let mut subscription = hub.subscribe(key, end, 20).unwrap();
@@ -418,7 +459,7 @@ mod tests {
 
     #[tokio::test]
     async fn range_filter() {
-        let hub = WatchHub::new(100, 16);
+        let hub = unbounded_bytes(100, 16);
         hub.apply(events(vec![], 1));
         let (key, end) = prefix_a();
         let mut subscription = hub.subscribe(key, end, 1).unwrap();
@@ -431,7 +472,7 @@ mod tests {
 
     #[tokio::test]
     async fn single_key_and_from_key_ranges() {
-        let hub = WatchHub::new(100, 16);
+        let hub = unbounded_bytes(100, 16);
         hub.apply(events(vec![], 1));
         let mut single = hub.subscribe(b"a/x".to_vec(), Vec::new(), 1).unwrap();
         let mut from_key = hub.subscribe(b"a/x".to_vec(), vec![0], 1).unwrap();
@@ -454,7 +495,7 @@ mod tests {
 
     #[tokio::test]
     async fn too_old_is_compacted() {
-        let hub = WatchHub::new(2, 16);
+        let hub = unbounded_bytes(2, 16);
         let (key, end) = everything();
         assert!(hub.subscribe(key.clone(), end.clone(), 5).is_err());
 
@@ -483,7 +524,7 @@ mod tests {
 
     #[tokio::test]
     async fn slow_subscriber_is_cancelled_and_others_continue() {
-        let hub = WatchHub::new(100, 2);
+        let hub = unbounded_bytes(100, 2);
         hub.apply(events(vec![], 1));
         let (key, end) = everything();
         let mut slow = hub.subscribe(key.clone(), end.clone(), 1).unwrap();
@@ -503,8 +544,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscriber_over_its_byte_bound_is_cancelled_and_others_continue() {
+        let hub = WatchHub::new(100, usize::MAX, 1024, 250);
+        hub.apply(events(vec![], 1));
+        let (key, end) = everything();
+        let mut slow = hub.subscribe(key.clone(), end.clone(), 1).unwrap();
+        let mut reader = hub.subscribe(key, end, 1).unwrap();
+
+        let mut seen = Vec::new();
+        for revision in 2..12 {
+            hub.apply(events(vec![sized("a/1", revision, 100)], revision));
+            seen.extend(events_until(&mut reader, revision).await);
+        }
+
+        assert_eq!(revisions(&seen), (2..12).collect::<Vec<_>>());
+        assert_eq!(
+            next_now(&mut slow).await,
+            Delivery::Cancelled { compacted: false }
+        );
+    }
+
+    #[tokio::test]
     async fn reset_cancels_everyone_as_compacted() {
-        let hub = WatchHub::new(100, 16);
+        let hub = unbounded_bytes(100, 16);
         hub.apply(events(vec![put("a/1", 5)], 10));
         let (key, end) = everything();
         let mut first = hub.subscribe(key.clone(), end.clone(), 10).unwrap();
@@ -532,7 +594,7 @@ mod tests {
 
     #[tokio::test]
     async fn progress_reports_watermark_after_queued_events() {
-        let hub = WatchHub::new(100, 16);
+        let hub = unbounded_bytes(100, 16);
         hub.apply(events(vec![], 1));
         let (key, end) = prefix_a();
         let mut subscription = hub.subscribe(key, end, 1).unwrap();
@@ -555,7 +617,7 @@ mod tests {
 
     #[tokio::test]
     async fn waits_for_first_watermark() {
-        let hub = WatchHub::new(100, 16);
+        let hub = unbounded_bytes(100, 16);
         let waiter = tokio::spawn({
             let hub = hub.clone();
             async move { hub.wait_for_watermark().await }
@@ -571,7 +633,7 @@ mod tests {
 
     #[tokio::test]
     async fn events_sharing_a_revision_are_delivered_in_one_batch() {
-        let hub = WatchHub::with_batch_limit(100, 64, 2);
+        let hub = WatchHub::with_batch_limit(100, usize::MAX, 64, usize::MAX, 2);
         hub.apply(events(vec![], 1));
         let (key, end) = everything();
         let mut live = hub.subscribe(key.clone(), end.clone(), 1).unwrap();
@@ -604,7 +666,7 @@ mod tests {
 
     #[tokio::test]
     async fn replay_respects_after_revision_inside_a_shared_revision() {
-        let hub = WatchHub::new(100, 16);
+        let hub = unbounded_bytes(100, 16);
         hub.apply(events(vec![], 1));
         hub.apply(events(
             vec![
@@ -629,7 +691,7 @@ mod tests {
 
     #[test]
     fn eviction_drops_whole_revisions() {
-        let hub = WatchHub::new(2, 16);
+        let hub = unbounded_bytes(2, 16);
         hub.apply(events(vec![], 1));
         hub.apply(events(
             vec![put("a/1", 10), put("a/2", 10), put("a/3", 20)],
@@ -638,10 +700,47 @@ mod tests {
         assert_eq!(hub.oldest_revision(), 11);
     }
 
+    #[test]
+    fn window_evicts_by_bytes_on_whole_revision_boundaries() {
+        let hub = WatchHub::new(100, 250, 16, usize::MAX);
+        hub.apply(events(vec![], 1));
+        hub.apply(events(vec![sized("a/0", 5, 10)], 5));
+        hub.apply(events(
+            vec![
+                sized("a/1", 10, 100),
+                sized("a/2", 10, 100),
+                sized("a/3", 10, 100),
+            ],
+            10,
+        ));
+
+        assert!(hub.state.lock().unwrap().window.is_empty());
+        assert_eq!(hub.oldest_revision(), 11);
+        let (key, end) = everything();
+        assert_eq!(
+            hub.subscribe(key.clone(), end.clone(), 9).err(),
+            Some(Compacted)
+        );
+        assert!(hub.subscribe(key, end, 10).is_ok());
+    }
+
+    #[test]
+    fn window_within_its_byte_bound_keeps_every_revision() {
+        let hub = WatchHub::new(100, 300, 16, usize::MAX);
+        hub.apply(events(vec![], 1));
+        hub.apply(events(
+            vec![sized("a/1", 5, 100), sized("a/2", 10, 200)],
+            10,
+        ));
+
+        assert_eq!(hub.state.lock().unwrap().window.len(), 2);
+        assert_eq!(hub.oldest_revision(), 2);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn subscribing_between_applies_neither_loses_nor_duplicates() {
         const LAST: i64 = 3000;
-        let hub = WatchHub::with_batch_limit(100_000, 100_000, 7);
+        let hub = WatchHub::with_batch_limit(100_000, usize::MAX, 100_000, usize::MAX, 7);
         hub.apply(events(vec![], 0));
         let all: Vec<ChangeEvent> = (1..=LAST)
             .flat_map(|revision| {
