@@ -4,7 +4,7 @@
 
 **Goal:** A stateless Rust server that speaks kube-apiserver's subset of the etcd v3 gRPC API and stores everything in TiKV, proven by k3s plus Argo Workflows running on two instances.
 
-**Architecture:** etcd revisions are TiKV commit timestamps. Writes are optimistic one-phase TiKV transactions; reads are snapshot reads that ask TiKV for each key's commit timestamp. Each instance tails TiKV's CDC stream, orders events by commit timestamp, and releases them to watchers only up to the resolved-timestamp watermark.
+**Architecture:** etcd revisions are TiKV commit timestamps. writes are optimistic two-phase TiKV transactions; reads are snapshot reads that ask TiKV for each key's commit timestamp. Each instance tails TiKV's CDC stream, orders events by commit timestamp, and releases them to watchers only up to the resolved-timestamp watermark.
 
 **Tech Stack:** Rust 2024, tokio, tonic 0.12 / prost 0.13 (matching the vendored `tikv-client` 0.4.0), `clap` for flags, `etcd-client` as a dev-dependency to drive the server in tests, Docker Compose for a local PD + TiKV.
 
@@ -16,7 +16,7 @@
 - Never deliver a watch event above the watermark, and never out of commit-timestamp order.
 - No instance-local durable state. No coordination between instances.
 - Anything kube-apiserver does not send returns gRPC `UNIMPLEMENTED`; unsupported `Txn` shapes return `UNIMPLEMENTED` with the shape in the message.
-- All TiKV keys are under `k/` (data) or `l/` (TTL index).
+- All TiKV keys are under `k/` (data), `l/` (TTL index) or `m/` (metadata: `m/compact`).
 - `Status` reports etcd version `3.5.13`.
 - Source carries no explanatory comments (user's global rule). A one-line comment is allowed only for an external constraint the code cannot express; deliberate shortcuts get a one-line `ponytail:` marker naming the ceiling.
 - Add no dependency beyond the Tech Stack line without a reason stated in the commit message.
@@ -139,7 +139,7 @@ impl Store {
     pub async fn compact(&self, revision: i64) -> Result<(), StoreError>;
 }
 ```
-Decisions: `revision == 0` in a query means "fetch a timestamp now". `create_revision` is `mod_revision` when `version == 1`, else `created`. `lease` is the TTL in seconds originally granted, or 0. A missing key compares as `ModRevision(0)` and `Version(0)`. `Delete` on a missing key is `Applied` with `prev: None` and the transaction's start timestamp as revision. `write` uses an optimistic transaction with `try_one_pc`, and on a TiKV write conflict retries from the read with no cap other than the request's deadline. `Rejected.revision` is the read timestamp. `compact` calls the client's `gc` with the revision as safepoint; a snapshot read that TiKV rejects as below the safepoint maps to `StoreError::Compacted`.
+Decisions: `revision == 0` in a query means "fetch a timestamp now". `create_revision` is `mod_revision` when `version == 1`, else `created`. `lease` is the TTL in seconds originally granted, or 0. A missing key compares as `ModRevision(0)` and `Version(0)`. `Delete` on a missing key is `Applied` with `prev: None` and the transaction's start timestamp as revision. `write` uses an optimistic two-phase transaction (never `try_one_pc`: its commit timestamps are not unique), and on a TiKV write conflict retries from the read with no cap other than the request's deadline. `Rejected.revision` is the read timestamp. `compact` calls the client's `gc` with the revision as safepoint; a snapshot read that TiKV rejects as below the safepoint maps to `StoreError::Compacted`.
 
 - [ ] **Step 1:** Write `tests/it_store.rs`; each test uses a unique random key prefix:
   - `create_then_get`: `write(k, Some(ModRevision(0)), Put)` is `Applied { revision: r, prev: None }`; `range` of `k` returns one kv with `mod_revision == r`, `create_revision == r`, `version == 1`.
