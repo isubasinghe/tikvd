@@ -2,8 +2,37 @@
 set -euo pipefail
 
 REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-WORK_DIR=$REPO_ROOT/target/acceptance
-CLUSTER_NAME=tikvd-acc
+CONFORMANCE=${CONFORMANCE:-}
+CONFORMANCE_BASELINE=${CONFORMANCE_BASELINE:-0}
+CONFORMANCE_FOCUS=${CONFORMANCE_FOCUS:-}
+CONFORMANCE_PARALLEL=${CONFORMANCE_PARALLEL:-16}
+HYDROPHONE_VERSION=v0.8.0
+case $CONFORMANCE in
+'') CONFORMANCE_FOCUS_DEFAULT= ;;
+focus) CONFORMANCE_FOCUS_DEFAULT='\[sig-api-machinery\].*\[Conformance\]' ;;
+full) CONFORMANCE_FOCUS_DEFAULT='\[Conformance\]' ;;
+*)
+    echo "acceptance: CONFORMANCE must be focus or full, not $CONFORMANCE" >&2
+    exit 2
+    ;;
+esac
+CONFORMANCE_FOCUS=${CONFORMANCE_FOCUS:-$CONFORMANCE_FOCUS_DEFAULT}
+if [[ $CONFORMANCE_BASELINE == 1 ]]; then
+    if [[ -z $CONFORMANCE_FOCUS ]]; then
+        echo "acceptance: CONFORMANCE_BASELINE=1 needs CONFORMANCE or CONFORMANCE_FOCUS" >&2
+        exit 2
+    fi
+    WORK_DIR=$REPO_ROOT/target/acceptance-base
+    CLUSTER_NAME=tikvd-acc-base
+else
+    WORK_DIR=$REPO_ROOT/target/acceptance
+    CLUSTER_NAME=tikvd-acc
+fi
+AGENTS=0
+[[ -z $CONFORMANCE_FOCUS ]] || AGENTS=2
+NODE_COUNT=$((AGENTS + 1))
+CONFORMANCE_DIR=$WORK_DIR/conformance
+HYDROPHONE=$WORK_DIR/bin/hydrophone
 K3S_IMAGE=rancher/k3s:v1.36.2-k3s1
 ARGO_VERSION=v4.1.6
 ARGO_RELEASE_URL=https://github.com/argoproj/argo-workflows/releases/download/$ARGO_VERSION/quick-start-minimal.yaml
@@ -192,18 +221,29 @@ create_network() {
 }
 
 create_cluster() {
-    say "creating k3d cluster $CLUSTER_NAME ($K3S_IMAGE) on $(datastore_endpoint "$HOST_GATEWAY")"
+    say "creating k3d cluster $CLUSTER_NAME ($K3S_IMAGE, $AGENTS agents) on $(datastore_endpoint "$HOST_GATEWAY")"
     k3d cluster create "$CLUSTER_NAME" \
-        --image "$K3S_IMAGE" --servers 1 --agents 0 --no-lb --network "$CLUSTER_NETWORK" \
+        --image "$K3S_IMAGE" --servers 1 --agents "$AGENTS" --no-lb --network "$CLUSTER_NETWORK" \
         --k3s-arg "--datastore-endpoint=$(datastore_endpoint "$HOST_GATEWAY")@server:0" \
         --kubeconfig-update-default=false --kubeconfig-switch-context=false \
         --timeout 300s >"$WORK_DIR/k3d-create.log" 2>&1 || fail "k3d cluster create (see $WORK_DIR/k3d-create.log)"
     k3d kubeconfig get "$CLUSTER_NAME" >"$KUBECONFIG"
 }
 
-node_is_ready() {
-    kubectl get nodes -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' | grep -q True
+create_baseline_cluster() {
+    say "creating baseline k3d cluster $CLUSTER_NAME ($K3S_IMAGE, $AGENTS agents) on k3s's built-in datastore"
+    k3d cluster create "$CLUSTER_NAME" \
+        --image "$K3S_IMAGE" --servers 1 --agents "$AGENTS" --no-lb \
+        --kubeconfig-update-default=false --kubeconfig-switch-context=false \
+        --timeout 300s >"$WORK_DIR/k3d-create.log" 2>&1 || fail "k3d cluster create (see $WORK_DIR/k3d-create.log)"
+    k3d kubeconfig get "$CLUSTER_NAME" >"$KUBECONFIG"
 }
+
+ready_node_count() {
+    kubectl get nodes -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' | grep -c True
+}
+
+node_is_ready() { (($(ready_node_count) == NODE_COUNT)); }
 
 fetch_argo_manifests() {
     curl -fsSL "$ARGO_RELEASE_URL" -o "$WORK_DIR/quick-start-minimal.yaml" || fail "fetch $ARGO_RELEASE_URL"
@@ -459,6 +499,7 @@ report_cache_inconsistency() {
     runs=$(awk '{ total += $NF } END { printf "%d", total }' <<<"$samples")
     unsuccessful=$(awk '!/status="success"/ { total += $NF } END { printf "%d", total }' <<<"$samples")
     if ((runs <= 0)); then
+        [[ -z $CONFORMANCE_FOCUS ]] || fail "cache consistency gate not asserted: kube-apiserver's checker reports no completed checks after the conformance run"
         say "cache consistency gate SKIPPED: kube-apiserver's checker reports no completed checks (apiserver_storage_consistency_checks_total sums to $runs); it runs every 5 minutes, so raise SOAK_SECS to have it asserted"
         return 0
     fi
@@ -469,14 +510,119 @@ report_cache_inconsistency() {
     say "cache consistency gate ASSERTED: kube-apiserver's checker ran $runs checks and none failed"
 }
 
-main() {
-    trap cleanup EXIT
+install_hydrophone() {
+    say "installing hydrophone $HYDROPHONE_VERSION into $(dirname "$HYDROPHONE")"
+    GOBIN=$(dirname "$HYDROPHONE") go install "sigs.k8s.io/hydrophone@$HYDROPHONE_VERSION" >"$WORK_DIR/hydrophone-install.log" 2>&1 ||
+        fail "go install hydrophone (see $WORK_DIR/hydrophone-install.log)"
+}
+
+run_conformance() {
+    local status=0
+    mkdir -p "$CONFORMANCE_DIR"
+    "$HYDROPHONE" --version >"$CONFORMANCE_DIR/hydrophone-version.txt" 2>&1
+    say "running conformance: hydrophone $HYDROPHONE_VERSION, focus '$CONFORMANCE_FOCUS', $CONFORMANCE_PARALLEL ginkgo processes (Serial specs run alone after the rest)"
+    say "hydrophone output: $CONFORMANCE_DIR/hydrophone.log"
+    "$HYDROPHONE" --kubeconfig "$KUBECONFIG" --focus "$CONFORMANCE_FOCUS" --parallel "$CONFORMANCE_PARALLEL" \
+        --output-dir "$CONFORMANCE_DIR" --disable-progress-status >"$CONFORMANCE_DIR/hydrophone.log" 2>&1 || status=$?
+    grep -E "Using conformance image|Server version|Tests finished after" "$CONFORMANCE_DIR/hydrophone.log" | sed "s/^/acceptance: /" >&2 || true
+    [[ -s $CONFORMANCE_DIR/junit_01.xml ]] || fail "hydrophone exited $status without a JUnit report (see $CONFORMANCE_DIR/hydrophone.log)"
+    say "JUnit: $CONFORMANCE_DIR/junit_01.xml"
+    say "e2e log: $CONFORMANCE_DIR/e2e.log"
+    return "$status"
+}
+
+junit_outcomes() {
+    python3 -I -c '
+import sys
+import xml.etree.ElementTree as ET
+counts = {"passed": 0, "failed": 0, "skipped": 0}
+failed = []
+for case in ET.parse(sys.argv[1]).iter("testcase"):
+    if case.find("failure") is not None or case.find("error") is not None:
+        counts["failed"] += 1
+        failed.append(case.get("name"))
+    elif not case.get("name", "").startswith("[It] "):
+        continue
+    elif case.find("skipped") is not None:
+        counts["skipped"] += 1
+    else:
+        counts["passed"] += 1
+print("conformance: {passed} passed / {failed} failed / {skipped} skipped".format(**counts))
+for name in failed:
+    print("FAILED: " + name)
+sys.exit(1 if failed else 0)' "$1"
+}
+
+report_conformance() {
+    local runner_status=$1 status=0
+    grep -E "^Ran [0-9]+ of [0-9]+ Specs|(SUCCESS|FAIL)! --" "$CONFORMANCE_DIR/e2e.log" | sed "s/^/acceptance: e2e: /" >&2 || true
+    junit_outcomes "$CONFORMANCE_DIR/junit_01.xml" || status=1
+    ((runner_status == 0)) || status=1
+    return "$status"
+}
+
+report_tikvd_peak_memory() {
+    local port pid
+    for port in "${TIKVD_PORTS[@]}"; do
+        pid=$(cat "$(tikvd_pid_file "$port")" 2>/dev/null) || continue
+        is_own_tikvd "$pid" || continue
+        say "tikvd on :$port (pid $pid): $(grep -E '^Vm(HWM|RSS)' "/proc/$pid/status" | tr -s ' \t' ' ' | paste -sd, -)"
+    done
+}
+
+prepare_work_dir() {
     k3d cluster delete "$CLUSTER_NAME" >/dev/null 2>&1 || true
     for port in "${TIKVD_PORTS[@]}"; do
         stop_tikvd "$port"
     done
     rm -rf "$WORK_DIR"
     mkdir -p "$WORK_DIR"
+}
+
+baseline_main() {
+    local runner_status=0 status=0
+    trap cleanup EXIT
+    prepare_work_dir
+    install_hydrophone
+    create_baseline_cluster
+    wait_until 300 "$NODE_COUNT nodes Ready" node_is_ready
+    run_conformance || runner_status=$?
+    report_conformance "$runner_status" || status=1
+    exit "$status"
+}
+
+conformance_main() {
+    local runner_status=0 status=0
+    trap cleanup EXIT
+    prepare_work_dir
+    install_hydrophone
+    build_tikvd
+    recreate_tikv
+    create_network
+    for port in "${TIKVD_PORTS[@]}"; do
+        start_tikvd "$port"
+    done
+    create_cluster
+    wait_until 300 "$NODE_COUNT nodes Ready" node_is_ready
+    run_conformance || runner_status=$?
+    report_conformance "$runner_status" || status=1
+    report_tikvd_peak_memory
+    collect_cluster_logs
+    report_cache_inconsistency
+    report_feed_resets
+    report_unimplemented
+    exit "$status"
+}
+
+main() {
+    if [[ $CONFORMANCE_BASELINE == 1 ]]; then
+        baseline_main
+    fi
+    if [[ -n $CONFORMANCE_FOCUS ]]; then
+        conformance_main
+    fi
+    trap cleanup EXIT
+    prepare_work_dir
     fetch_argo_manifests
     build_tikvd
     recreate_tikv
