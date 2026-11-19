@@ -85,7 +85,10 @@ pub async fn serve_listener(
     let server = builder
         .add_service(health_service)
         .add_service(LeaseServer::new(LeaseService::new(state.store.clone())))
-        .add_service(KvServer::new(KvService::new(state.store.clone())))
+        .add_service(KvServer::new(KvService::new(
+            state.store.clone(),
+            state.hub.clone(),
+        )))
         .add_service(WatchServer::new(WatchService::new(
             state.store.clone(),
             state.hub.clone(),

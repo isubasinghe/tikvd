@@ -28,7 +28,14 @@ pub enum Delivery {
 pub struct WatchHub {
     state: Mutex<HubState>,
     ready: watch::Sender<bool>,
+    applied: watch::Sender<Applied>,
     limits: Limits,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Applied {
+    watermark: i64,
+    resets: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -110,6 +117,7 @@ impl WatchHub {
         Arc::new(WatchHub {
             state: Mutex::new(HubState::default()),
             ready: watch::Sender::new(false),
+            applied: watch::Sender::new(Applied::default()),
             limits: Limits {
                 window_events,
                 window_bytes,
@@ -138,6 +146,14 @@ impl WatchHub {
 
     pub async fn wait_for_watermark(&self) {
         let _ = self.ready.subscribe().wait_for(|ready| *ready).await;
+    }
+
+    pub async fn delivered(&self, revision: i64) {
+        let mut applied = self.applied.subscribe();
+        let resets = applied.borrow().resets;
+        let _ = applied
+            .wait_for(|applied| applied.watermark >= revision || applied.resets != resets)
+            .await;
     }
 
     pub fn subscribe(
@@ -183,6 +199,8 @@ impl WatchHub {
         state.window.extend(events);
         state.evict_beyond(limits);
         state.watermark = watermark;
+        self.applied
+            .send_modify(|applied| applied.watermark = watermark);
         drop(state);
         self.ready
             .send_if_modified(|ready| !std::mem::replace(ready, true));
@@ -196,6 +214,7 @@ impl WatchHub {
         state.window.clear();
         state.window_bytes = 0;
         state.floor = None;
+        self.applied.send_modify(|applied| applied.resets += 1);
         drop(state);
         self.ready.send_replace(false);
     }
@@ -353,6 +372,8 @@ impl Subscription {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    use tokio::task::JoinHandle;
 
     use super::*;
     use crate::record::Record;
@@ -664,6 +685,145 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), waiter)
             .await
             .unwrap()
+            .unwrap();
+    }
+
+    async fn resolves_now(hub: &WatchHub, revision: i64) -> bool {
+        tokio::time::timeout(Duration::from_millis(50), hub.delivered(revision))
+            .await
+            .is_ok()
+    }
+
+    fn spawn_delivered(hub: &Arc<WatchHub>, revision: i64) -> JoinHandle<()> {
+        let hub = hub.clone();
+        tokio::spawn(async move { hub.delivered(revision).await })
+    }
+
+    async fn settle() {
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn delivered_resolves_at_once_for_an_already_applied_revision() {
+        let hub = unbounded_bytes(100, 16);
+        hub.apply(events(vec![put("a/1", 7)], 10));
+
+        assert!(resolves_now(&hub, 7).await);
+        assert!(resolves_now(&hub, 10).await);
+        assert!(!resolves_now(&hub, 11).await);
+    }
+
+    #[tokio::test]
+    async fn delivered_waits_until_an_apply_reaches_the_revision() {
+        let hub = unbounded_bytes(100, 16);
+        hub.apply(events(vec![], 10));
+        let waiter = spawn_delivered(&hub, 20);
+
+        settle().await;
+        assert!(!waiter.is_finished());
+        hub.apply(events(vec![], 19));
+        settle().await;
+        assert!(!waiter.is_finished());
+        hub.apply(events(vec![put("a/1", 20)], 20));
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("resolved by the apply that reached it")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn delivered_means_the_events_are_already_queued_to_subscribers() {
+        let hub = unbounded_bytes(100, 16);
+        hub.apply(events(vec![], 1));
+        let (key, end) = everything();
+        let mut subscription = hub.subscribe(key, end, 1).unwrap();
+        let waiter = spawn_delivered(&hub, 5);
+        settle().await;
+
+        hub.apply(events(vec![put("a/1", 5)], 6));
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("resolved by the apply")
+            .unwrap();
+
+        assert_eq!(
+            subscription.take(),
+            Some(Delivery::Events {
+                events: vec![put("a/1", 5)],
+                watermark: 6
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn waiters_at_different_revisions_each_resolve_at_the_apply_that_reaches_them() {
+        let hub = unbounded_bytes(100, 16);
+        hub.apply(events(vec![], 0));
+        let revisions = [3, 17, 8, 30, 8, 1, 25, 12, 30, 21];
+        let waiters: Vec<(i64, JoinHandle<()>)> = revisions
+            .iter()
+            .map(|&revision| (revision, spawn_delivered(&hub, revision)))
+            .collect();
+
+        for watermark in [2, 5, 8, 15, 20, 24, 29, 30] {
+            hub.apply(events(vec![], watermark));
+            settle().await;
+            for (revision, waiter) in &waiters {
+                assert_eq!(
+                    waiter.is_finished(),
+                    *revision <= watermark,
+                    "waiter at {revision} after applying {watermark}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn waiters_racing_concurrent_applies_all_resolve() {
+        const LAST: i64 = 5000;
+        let hub = unbounded_bytes(100, 16);
+        hub.apply(events(vec![], 0));
+        let applier = std::thread::spawn({
+            let hub = hub.clone();
+            move || {
+                for watermark in 1..=LAST {
+                    hub.apply(events(vec![], watermark));
+                }
+            }
+        });
+
+        let mut waiters = Vec::new();
+        let mut revision = 1;
+        while !applier.is_finished() && revision <= LAST {
+            let target = (hub.watermark() + revision % 7 - 3).clamp(1, LAST);
+            waiters.push(spawn_delivered(&hub, target));
+            revision += 1;
+            tokio::task::yield_now().await;
+        }
+        applier.join().unwrap();
+        assert!(waiters.len() > 10, "only {} waiters", waiters.len());
+        for waiter in waiters {
+            tokio::time::timeout(Duration::from_secs(5), waiter)
+                .await
+                .expect("no waiter misses the apply that reaches it")
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reset_releases_waiters_because_every_watcher_is_cancelled() {
+        let hub = unbounded_bytes(100, 16);
+        hub.apply(events(vec![], 10));
+        let waiter = spawn_delivered(&hub, 20);
+        settle().await;
+
+        hub.apply(FeedOutput::Reset);
+
+        tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("released by the reset")
             .unwrap();
     }
 
