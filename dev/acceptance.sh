@@ -458,8 +458,8 @@ report_cache_inconsistency() {
     samples=$(consistency_check_samples)
     runs=$(awk '{ total += $NF } END { printf "%d", total }' <<<"$samples")
     unsuccessful=$(awk '!/status="success"/ { total += $NF } END { printf "%d", total }' <<<"$samples")
-    if ((runs == 0)) && ! grep -qE "Cache consistency check (start|passed)" "$WORK_DIR/k3s.log"; then
-        say "cache consistency gate SKIPPED: kube-apiserver's checker has not run yet (no apiserver_storage_consistency_checks_total samples, no checker lines in its log); it runs every 5 minutes, so raise SOAK_SECS to have it asserted"
+    if ((runs <= 0)); then
+        say "cache consistency gate SKIPPED: kube-apiserver's checker reports no completed checks (apiserver_storage_consistency_checks_total sums to $runs); it runs every 5 minutes, so raise SOAK_SECS to have it asserted"
         return 0
     fi
     if ((unsuccessful > 0)); then

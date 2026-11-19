@@ -122,6 +122,11 @@ but not observed.
    it holds. Other tags, including v8.5.1 to v8.5.3, v8.5.7 and
    everything before v7.5.8, were not tested.
    From source: `BatchGet` accepts the flag too and `Scan` does not.
+6. `Transaction::commit` in `tikv-client` 0.4.0 returns `Some` commit
+   timestamp for one-phase and two-phase commits. From source: it does not
+   set `need_commit_ts`, does not expose CDC, and keeps its protobuf types
+   and PD/region client private. Its default `prometheus` feature needs a
+   system OpenSSL to build.
 7. From source: TiKV does not publish a resolved timestamp for a region
    whose range has shrunk (by a split or merge) before it sends that
    region's error to its CDC subscribers. The feed's safety relies on
@@ -133,11 +138,6 @@ but not observed.
    why lock cleanup scoped to the `k/` range is enough. On a TiKV version
    that tracked locks region-wide, such a lock would instead stall every
    instance's watermark until something else resolved it.
-6. `Transaction::commit` in `tikv-client` 0.4.0 returns `Some` commit
-   timestamp for one-phase and two-phase commits. From source: it does not
-   set `need_commit_ts`, does not expose CDC, and keeps its protobuf types
-   and PD/region client private. Its default `prometheus` feature needs a
-   system OpenSSL to build.
 
 ## Assumptions
 
@@ -296,6 +296,8 @@ A client watch with start revision R:
 - R is 0: fetch a timestamp T from PD and deliver events above T.
 - R older than the window, or older than the instance's start: fail the
   watch with etcd's compacted error. kube-apiserver responds by relisting.
+- R within the window, but the replay from R would exceed the per-watcher
+  queue bound: fail the watch with etcd's compacted error.
 
 Progress notifications and `WatchProgressRequest` report the watermark.
 
