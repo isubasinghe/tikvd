@@ -185,7 +185,8 @@ impl WatchStreamState {
         let Ok(subscription) = subscribed else {
             debug!(
                 watch_id,
-                after_revision, "watch start is outside the window, cancelled as compacted"
+                after_revision,
+                "watch start cannot be replayed from the window, cancelled as compacted"
             );
             self.send(compacted_response(watch_id, start_point, &self.hub))
                 .await;

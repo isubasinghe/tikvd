@@ -162,9 +162,10 @@ impl WatchHub {
             .window
             .partition_point(|event| event.revision <= after_revision);
         let replay = state.window.range(first_unseen..);
-        if subscriber.offer(replay, state.watermark, self.limits) {
-            state.subscribers.push(subscriber);
+        if !subscriber.offer(replay, state.watermark, self.limits) {
+            return Err(Compacted);
         }
+        state.subscribers.push(subscriber);
         Ok(Subscription {
             reported: state.watermark,
             queue,
@@ -562,6 +563,41 @@ mod tests {
             next_now(&mut slow).await,
             Delivery::Cancelled { compacted: false }
         );
+    }
+
+    #[test]
+    fn replay_larger_than_the_subscriber_byte_bound_is_refused_as_compacted() {
+        let hub = WatchHub::new(100, usize::MAX, 1024, 250);
+        hub.apply(events(vec![], 1));
+        hub.apply(events(
+            vec![
+                sized("a/1", 2, 100),
+                sized("a/2", 3, 100),
+                sized("a/3", 4, 100),
+            ],
+            4,
+        ));
+        let (key, end) = everything();
+
+        assert_eq!(
+            hub.subscribe(key.clone(), end.clone(), 1).err(),
+            Some(Compacted)
+        );
+        assert!(hub.subscribe(key, end, 2).is_ok());
+    }
+
+    #[test]
+    fn replay_larger_than_the_subscriber_batch_bound_is_refused_as_compacted() {
+        let hub = WatchHub::with_batch_limit(100, usize::MAX, 2, usize::MAX, 1);
+        hub.apply(events(vec![], 1));
+        hub.apply(events(vec![put("a/1", 2), put("a/2", 3), put("a/3", 4)], 4));
+        let (key, end) = everything();
+
+        assert_eq!(
+            hub.subscribe(key.clone(), end.clone(), 1).err(),
+            Some(Compacted)
+        );
+        assert!(hub.subscribe(key, end, 2).is_ok());
     }
 
     #[tokio::test]

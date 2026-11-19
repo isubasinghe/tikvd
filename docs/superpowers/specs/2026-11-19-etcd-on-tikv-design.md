@@ -383,6 +383,8 @@ repo this way.)
 - The watch window is bounded by 100,000 events and by 256 MiB; each
   watcher's queue by 1024 batches and by 64 MiB. A watcher that passes
   either queue bound is cancelled.
+- A watch whose replay from the window would exceed the per-watcher
+  bound is told to relist (cancelled as compacted).
 
 ## Order of work
 
