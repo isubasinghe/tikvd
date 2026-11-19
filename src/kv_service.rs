@@ -13,8 +13,8 @@ use crate::pb::mvccpb;
 use crate::store::{self, RangeQuery, Store, StoreError, Write, WriteOutcome};
 
 const CLUSTER_ID: u64 = 0x7469_6b76_6401;
-const MEMBER_ID: u64 = 0x7469_6b76_6402;
-const RAFT_TERM: u64 = 1;
+pub(crate) const MEMBER_ID: u64 = 0x7469_6b76_6402;
+pub(crate) const RAFT_TERM: u64 = 1;
 
 const COMPACTED: &str = "etcdserver: mvcc: required revision has been compacted";
 const FUTURE_REVISION: &str = "etcdserver: mvcc: required revision is a future revision";
@@ -206,8 +206,12 @@ impl Kv for KvService {
         &self,
         request: Request<CompactionRequest>,
     ) -> Result<Response<CompactionResponse>, Status> {
-        debug!(rpc = "compact", revision = request.get_ref().revision);
-        Err(unsupported("compact"))
+        let request = request.into_inner();
+        debug!(rpc = "compact", revision = request.revision);
+        let revision = self.store.compact(request.revision).await.map_err(status)?;
+        Ok(Response::new(CompactionResponse {
+            header: Some(header(revision)),
+        }))
     }
 }
 

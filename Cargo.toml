@@ -6,15 +6,17 @@ build = "build.rs"
 
 [dependencies]
 tikv-client = { path = "vendor/tikv-client", default-features = false }
-tonic = "0.12"
+tonic = { version = "0.12", features = ["tls"] }
 prost = "0.13"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
+tonic-health = "0.12"
 
 [build-dependencies]
 tonic-build = "0.12"
 
 [dev-dependencies]
-etcd-client = "0.14"
+etcd-client = { version = "0.14", features = ["tls"] }
+rcgen = "0.14"

@@ -14,7 +14,7 @@ use tracing::{debug, info, warn};
 
 use super::plan::KeyRange;
 pub use super::session::FeedOutput;
-use super::session::{Action, Session, SessionConfig, retry_delay};
+use super::session::{Action, LookedUp, Session, SessionConfig, retry_delay};
 use crate::store::Store;
 
 const OUTPUT_CAPACITY: usize = 64;
@@ -102,7 +102,7 @@ enum Incoming {
     LookedUp {
         range: KeyRange,
         attempt: u32,
-        routes: Result<Vec<RegionRoute>, String>,
+        looked_up: Result<LookedUp, String>,
     },
     Clock(Option<u64>),
     CleanupDone,
@@ -210,8 +210,8 @@ impl Runner {
             Incoming::LookedUp {
                 range,
                 attempt,
-                routes,
-            } => session.on_lookup(range, attempt, routes),
+                looked_up,
+            } => session.on_lookup(range, attempt, looked_up),
             Incoming::Clock(now) => {
                 self.clock_pending = false;
                 now.map_or_else(Vec::new, |now| session.on_clock(now))
@@ -273,14 +273,12 @@ impl Runner {
         let incoming = self.incoming.clone();
         tokio::spawn(async move {
             tokio::time::sleep(after).await;
-            let routes = lookup_regions(&store, &range)
-                .await
-                .map_err(|error| error.to_string());
+            let looked_up = look_up_with_compaction(&store, &range).await;
             let _ = incoming
                 .send(Incoming::LookedUp {
                     range,
                     attempt,
-                    routes,
+                    looked_up,
                 })
                 .await;
         });
@@ -333,6 +331,20 @@ async fn start_timestamp(store: &Store, out: &mpsc::Sender<FeedOutput>) -> Optio
         attempt += 1;
         tokio::time::sleep(retry_delay(attempt)).await;
     }
+}
+
+async fn look_up_with_compaction(store: &Store, range: &KeyRange) -> Result<LookedUp, String> {
+    let routes = lookup_regions(store, range)
+        .await
+        .map_err(|error| error.to_string())?;
+    let compact_revision = store
+        .compact_revision()
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(LookedUp {
+        routes,
+        compact_revision: compact_revision as u64,
+    })
 }
 
 async fn lookup_regions(

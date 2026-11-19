@@ -240,15 +240,6 @@ async fn future_revision_is_out_of_range() {
     assert_eq!(status_code(&error), Code::OutOfRange);
 }
 
-#[tokio::test]
-async fn compact_is_unimplemented() {
-    let Some((mut client, _)) = start_tikvd().await else {
-        return;
-    };
-    let error = client.compact(1, None).await.unwrap_err();
-    assert_eq!(status_code(&error), Code::Unimplemented);
-}
-
 fn status_code(error: &Error) -> Code {
     match error {
         Error::GRpcStatus(status) => status.code(),

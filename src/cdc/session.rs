@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 
 use super::encoding::memcomparable_key;
 use super::plan::{
-    Coverage, FreshRegion, KeyRange, fresh_region, is_covered, is_older_than_tracked,
+    Coverage, FreshRegion, KeyRange, Replacement, fresh_region, is_covered, is_older_than_tracked,
     plan_replacement,
 };
 use super::{Assembler, ChangeEvent, Sorter};
@@ -53,6 +53,12 @@ pub enum Action {
     },
     Emit(FeedOutput),
     Reset,
+}
+
+#[derive(Debug, Clone)]
+pub struct LookedUp {
+    pub routes: Vec<RegionRoute>,
+    pub compact_revision: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -162,10 +168,13 @@ impl Session {
         &mut self,
         range: KeyRange,
         attempt: u32,
-        routes: Result<Vec<RegionRoute>, String>,
+        looked_up: Result<LookedUp, String>,
     ) -> Vec<Action> {
-        let routes = match routes {
-            Ok(routes) => routes,
+        let LookedUp {
+            routes,
+            compact_revision,
+        } = match looked_up {
+            Ok(looked_up) => looked_up,
             Err(error) => {
                 warn!(%error, attempt, "looking up cdc regions failed, retrying");
                 self.look_up_later(range, attempt + 1);
@@ -189,7 +198,7 @@ impl Session {
             self.look_up_later(range, attempt + 1);
             return self.take_actions();
         }
-        self.replace_regions(&fresh, attempt);
+        self.replace_regions(&fresh, attempt, compact_revision);
         self.take_actions()
     }
 
@@ -405,7 +414,7 @@ impl Session {
         });
     }
 
-    fn replace_regions(&mut self, fresh: &[FreshRegion], attempt: u32) {
+    fn replace_regions(&mut self, fresh: &[FreshRegion], attempt: u32, compact_revision: u64) {
         let fallback = self
             .tracked
             .values()
@@ -413,6 +422,14 @@ impl Session {
             .min()
             .unwrap_or(self.config.floor);
         let plan = plan_replacement(&self.coverage(), fresh, fallback);
+        if self.inherits_compacted_checkpoint(&plan, compact_revision) {
+            warn!(
+                compact_revision,
+                "a cdc region would resume below the compaction revision, resetting the feed"
+            );
+            self.actions.push(Action::Reset);
+            return;
+        }
         let superseded: Vec<u64> = plan
             .dropped
             .iter()
@@ -448,6 +465,15 @@ impl Session {
         for region in fresh.iter().filter(|f| reset.contains(&f.id)) {
             self.register(region.id, &region.store_address);
         }
+    }
+
+    fn inherits_compacted_checkpoint(&self, plan: &Replacement, compact_revision: u64) -> bool {
+        let lowest = plan
+            .registered
+            .iter()
+            .map(|(_, checkpoint)| *checkpoint)
+            .min();
+        !self.tracked.is_empty() && lowest.is_some_and(|lowest| lowest < compact_revision)
     }
 
     fn coverage(&self) -> BTreeMap<u64, Coverage> {
@@ -914,9 +940,64 @@ mod tests {
         events.iter().map(|(_, watermark)| *watermark).collect()
     }
 
+    fn found(routes: Vec<RegionRoute>) -> Result<LookedUp, String> {
+        found_compacted_at(routes, 0)
+    }
+
+    fn found_compacted_at(
+        routes: Vec<RegionRoute>,
+        compact_revision: u64,
+    ) -> Result<LookedUp, String> {
+        Ok(LookedUp {
+            routes,
+            compact_revision,
+        })
+    }
+
+    fn resets(actions: &[Action]) -> bool {
+        actions.contains(&Action::Reset)
+    }
+
+    fn reregister_whole_after_error(session: &mut Session, compact_revision: u64) -> Vec<Action> {
+        let reg = register_one(session, route(1, "", "~", 1));
+        session.on_change_data(reg.stream, rows(&reg, vec![initialized()]));
+        session.on_change_data(reg.stream, region_error(&reg));
+        session.on_lookup(
+            clamp_raw(&route(1, "", "~", 1)),
+            1,
+            found_compacted_at(vec![route(1, "", "~", 1)], compact_revision),
+        )
+    }
+
+    #[test]
+    fn reregistration_below_the_compaction_revision_resets() {
+        let mut session = session(100);
+        let actions = reregister_whole_after_error(&mut session, 150);
+        assert!(resets(&actions), "{actions:?}");
+        assert!(registrations(&actions).is_empty(), "{actions:?}");
+    }
+
+    #[test]
+    fn reregistration_at_or_above_the_compaction_revision_proceeds() {
+        let mut session = session(100);
+        let actions = reregister_whole_after_error(&mut session, 100);
+        assert!(!resets(&actions), "{actions:?}");
+        assert_eq!(registrations(&actions).len(), 1, "{actions:?}");
+        assert_eq!(registrations(&actions)[0].checkpoint, 99);
+    }
+
+    #[test]
+    fn fresh_session_start_is_not_subject_to_the_compaction_check() {
+        let mut session = session(100);
+        let whole = route(1, "", "~", 1);
+        let actions = session.on_lookup(clamp_raw(&whole), 0, found_compacted_at(vec![whole], 150));
+        assert!(!resets(&actions), "{actions:?}");
+        assert_eq!(registrations(&actions).len(), 1, "{actions:?}");
+    }
+
     fn register_one(session: &mut Session, route: RegionRoute) -> Reg {
         let range = clamp_raw(&route);
-        let actions = session.on_lookup(range, 0, Ok(vec![route]));
+        let actions = session.on_lookup(range, 0, found(vec![route]));
         registrations(&actions).remove(0)
     }
 
@@ -1004,7 +1085,7 @@ mod tests {
     fn two_regions_at(session: &mut Session, resolved_ts: u64) -> (Reg, Reg) {
         let left = route(5, "", "m", 3);
         let right = route(2, "m", "~", 3);
-        let actions = session.on_lookup(watched_range(), 0, Ok(vec![left, right]));
+        let actions = session.on_lookup(watched_range(), 0, found(vec![left, right]));
         let regs = registrations(&actions);
         let five = regs.iter().find(|r| r.region_id == 5).unwrap().clone();
         let two = regs.iter().find(|r| r.region_id == 2).unwrap().clone();
@@ -1021,7 +1102,7 @@ mod tests {
         session.on_change_data(five.stream, region_error(&five));
 
         let stale = route(5, "", "q", 2);
-        let actions = session.on_lookup(clamp_raw(&route(5, "", "m", 3)), 1, Ok(vec![stale]));
+        let actions = session.on_lookup(clamp_raw(&route(5, "", "m", 3)), 1, found(vec![stale]));
         assert!(registrations(&actions).is_empty(), "{actions:?}");
         assert!(deregistered(&actions).is_empty(), "{actions:?}");
         assert_eq!(looked_up(&actions).len(), 1);
@@ -1057,7 +1138,7 @@ mod tests {
         let actions = session.on_lookup(
             clamp_raw(&route(1, "", "~", 1)),
             1,
-            Ok(vec![route(1, "", "m", 2), route(3, "m", "~", 2)]),
+            found(vec![route(1, "", "m", 2), route(3, "m", "~", 2)]),
         );
         let regs = registrations(&actions);
         let left = regs.iter().find(|r| r.region_id == 1).unwrap().clone();

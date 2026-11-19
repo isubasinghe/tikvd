@@ -12,6 +12,7 @@ use crate::keys::{data_key, data_range, etcd_key, ttl_key, ttl_range_until};
 use crate::record::Record;
 
 const SCAN_PAGE: usize = 1024;
+const COMPACT_KEY: &[u8] = b"m/compact";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct KeyValue {
@@ -138,6 +139,9 @@ impl Store {
     }
 
     pub async fn range(&self, q: RangeQuery) -> Result<RangeResult, StoreError> {
+        if q.revision != 0 && q.revision < self.compact_revision().await? {
+            return Err(StoreError::Compacted);
+        }
         let read_at = self.read_timestamp(q.revision).await?;
         let revision = read_at.version() as i64;
         let mut snapshot = self.client.snapshot(read_at, read_options());
@@ -227,17 +231,31 @@ impl Store {
         }
     }
 
-    pub async fn compact(&self, revision: i64) -> Result<(), StoreError> {
+    pub async fn compact(&self, revision: i64) -> Result<i64, StoreError> {
         if revision <= 0 {
             return Err(StoreError::Compacted);
         }
         if revision > self.now().await? {
             return Err(StoreError::FutureRevision);
         }
-        self.client
-            .gc(Timestamp::from_version(revision as u64))
-            .await?;
-        Ok(())
+        let (previous, committed) = loop {
+            if let Some(raised) = self.try_raise_compaction(revision).await? {
+                break raised;
+            }
+        };
+        if previous > 0 {
+            // ponytail: gc resolves locks across the whole keyspace before moving the safepoint; scope it to k/ if that gets slow
+            self.client
+                .gc(Timestamp::from_version(previous as u64))
+                .await?;
+        }
+        Ok(committed)
+    }
+
+    pub async fn compact_revision(&self) -> Result<i64, StoreError> {
+        let read_at = self.client.current_timestamp().await?;
+        let mut snapshot = self.client.snapshot(read_at, read_options());
+        decode_compact_revision(snapshot.get(COMPACT_KEY.to_vec()).await?)
     }
 
     async fn read_timestamp(&self, revision: i64) -> Result<Timestamp, StoreError> {
@@ -292,6 +310,19 @@ impl Store {
             revision,
             prev: current.map(|current| current.key_value(key)),
         }))
+    }
+
+    async fn try_raise_compaction(&self, revision: i64) -> Result<Option<(i64, i64)>, StoreError> {
+        let mut txn = self.begin_write().await?;
+        let previous = decode_compact_revision(txn.get(COMPACT_KEY.to_vec()).await?)?;
+        if revision <= previous {
+            return Err(StoreError::Compacted);
+        }
+        txn.put(COMPACT_KEY.to_vec(), revision.to_be_bytes().to_vec())
+            .await?;
+        Ok(commit_unless_conflicted(&mut txn)
+            .await?
+            .map(|committed| (previous, committed)))
     }
 
     async fn try_delete_if_expired(
@@ -353,6 +384,16 @@ async fn read_current(txn: &mut Transaction, key: &[u8]) -> Result<Option<Curren
         record: decode(key, &bytes)?,
         mod_revision: commit_ts.version() as i64,
     }))
+}
+
+fn decode_compact_revision(bytes: Option<Vec<u8>>) -> Result<i64, StoreError> {
+    let Some(bytes) = bytes else {
+        return Ok(0);
+    };
+    let bytes: [u8; 8] = bytes
+        .try_into()
+        .map_err(|_| StoreError::Corrupt(COMPACT_KEY.to_vec()))?;
+    Ok(i64::from_be_bytes(bytes))
 }
 
 fn compare_holds(compare: Compare, current: Option<&Current>) -> bool {
