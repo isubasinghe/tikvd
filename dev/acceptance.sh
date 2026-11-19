@@ -79,7 +79,7 @@ build_tikvd() {
     cargo build --release --manifest-path "$REPO_ROOT/Cargo.toml" >/dev/null 2>&1 || fail "cargo build"
 }
 
-tikvd_feed_started() { tail -n "+$(($2 + 1))" "$(tikvd_log "$1")" | grep -q "cdc feed starting"; }
+tikvd_feed_started() { tail -n "+$(($2 + 1))" "$(tikvd_log "$1")" | grep "cdc feed starting" >/dev/null; }
 
 start_tikvd() {
     local port=$1 lines_before=0
@@ -87,6 +87,7 @@ start_tikvd() {
     NO_COLOR=1 RUST_LOG=$TIKVD_LOG_FILTER "$TIKVD_BINARY" \
         --listen "$HOST_GATEWAY:$port" --pd "$PD_ADDRESS" >>"$(tikvd_log "$port")" 2>&1 &
     echo $! >"$(tikvd_pid_file "$port")"
+    echo "$port" >>"$WORK_DIR/tikvd-starts"
     wait_until 60 "tikvd on :$port" tikvd_feed_started "$port" "$lines_before"
     say "tikvd on :$port started (pid $(cat "$(tikvd_pid_file "$port")"))"
 }
@@ -242,15 +243,37 @@ for i in range(0, len(raw) + 1, 8):
 print(out.hex().upper())' "$1"
 }
 
+region_id_holding() {
+    curl -fsS "http://$PD_ADDRESS/pd/api/v1/region/key/$(memcomparable_hex "$1")?format=hex" | jq '.id'
+}
+
+log_lines() { wc -l <"$(tikvd_log "$1")"; }
+
+log_since() { tail -n "+$(($2 + 1))" "$(tikvd_log "$1")"; }
+
+registered_since() { log_since "$1" "$2" | grep "registering cdc region region_id=$3 " >/dev/null; }
+
 split_registry_region() {
-    local split_key=k/registry/pods/ region_id before
-    region_id=$(curl -fsS "http://$PD_ADDRESS/pd/api/v1/region/key/$(memcomparable_hex "$split_key")?format=hex" | jq '.id')
+    local split_key=k/registry/pods/ left_key=k/ region_id before port left_id right_id
+    local -A lines_before
+    region_id=$(region_id_holding "$split_key")
     before=$(region_count)
+    for port in "${TIKVD_PORTS[@]}"; do
+        lines_before[$port]=$(log_lines "$port")
+    done
     say "splitting region $region_id at $split_key ($before regions)"
     docker exec tikvd-dev-pd-1 /pd-ctl -u "http://$PD_ADDRESS" operator add split-region "$region_id" \
         --policy=usekey --keys="$(memcomparable_hex "$split_key")" >&2
     wait_until 60 "PD to report the split" region_count_above "$before"
-    say "PD reports $(region_count) regions after the split"
+    left_id=$(region_id_holding "$left_key")
+    right_id=$(region_id_holding "$split_key")
+    say "PD reports $(region_count) regions after the split: $left_id below $split_key, $right_id from it"
+    for port in "${TIKVD_PORTS[@]}"; do
+        wait_until 30 "tikvd on :$port to register region $left_id" registered_since "$port" "${lines_before[$port]}" "$left_id"
+        wait_until 30 "tikvd on :$port to register region $right_id" registered_since "$port" "${lines_before[$port]}" "$right_id"
+        log_since "$port" "${lines_before[$port]}" | grep -E "cdc region error|registering cdc region" |
+            cut -c1-200 | sed "s/^/acceptance: :$port /" >&2
+    done
 }
 
 run_disruption_checks() {
@@ -281,6 +304,18 @@ report_unimplemented() {
         fi
     done
     ((found == 0)) || fail "tikvd logged UNIMPLEMENTED requests (above)"
+}
+
+report_feed_resets() {
+    local port starts feed_starts
+    for port in "${TIKVD_PORTS[@]}"; do
+        if grep "resetting the feed" "$(tikvd_log "$port")" >&2; then
+            fail "tikvd on :$port reset its cdc feed (above)"
+        fi
+        starts=$(grep -cx "$port" "$WORK_DIR/tikvd-starts")
+        feed_starts=$(grep -c "cdc feed starting" "$(tikvd_log "$port")")
+        ((feed_starts == starts)) || fail "tikvd on :$port started its cdc feed $feed_starts times in $starts process starts"
+    done
 }
 
 report_cache_inconsistency() {
@@ -318,6 +353,7 @@ main() {
     fi
     collect_cluster_logs
     report_cache_inconsistency
+    report_feed_resets
     report_unimplemented
     echo "workflow Succeeded"
 }
