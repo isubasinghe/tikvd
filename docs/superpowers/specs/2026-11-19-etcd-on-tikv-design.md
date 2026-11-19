@@ -448,6 +448,43 @@ re-runs of failed tests on `tikvd`.
   caused by `tikvd`; failed 1 of 2. The DaemonSet controller deleted the
   revision the test then tried to delete, 19 ms earlier.
 
+Re-run on 2026-11-19 after the feed began releasing from the CDC message
+that moves the watermark and `cdc.min-ts-interval` became 10ms (fact 9),
+same cluster shape and suite:
+
+- Full, `[Conformance]`, 28 min: 442 passed, 4 failed, 7133 skipped.
+  Gates: no `UNIMPLEMENTED`, no feed reset, cache consistency asserted
+  (418 checks, none failed).
+- AdmissionWebhook timeout, NoExecuteTaintManager, OrderedNamespaceDeletion
+  and ControllerRevision passed.
+- kube-controller-manager logged 1,140 `is not as new as written version`
+  errors against 2,158 before. The write each one had not yet seen was
+  44 ms old at p50 and 111 ms at p99 when logged (98 and 262 ms before),
+  measured from the write's commit timestamp, which trails wall clock.
+- Mean `etcd_request_duration_seconds` at the end of the run: create
+  27.8 ms, update 24.8, delete 16.7, get 1.5, list 3.7.
+
+All four failures are one race in kube-apiserver's CRD finalizer, each
+failing a CRD delete after 30 s. Re-run alone twice each: CRD
+creating/deleting failed 1 of 2, CRD listing 2 of 2, CustomResourcePublishOpenAPI
+same group and version but different kinds 2 of 2, same group but
+different versions 1 of 2.
+
+- The finalizer's first list of the custom resources creates their watch
+  cache and fails with "storage is (re)initializing"; this happens on the
+  Kine baseline too. It writes a failure condition and retries 11 to
+  238 ms later from its CRD lister. If the lister has not yet seen that write,
+  the retry's status update conflicts and the finalizer drops the key;
+  the write itself changed only the Terminating condition, which the
+  finalizer does not requeue on. The CRD is then deleted at the five-minute
+  resync.
+- Over the full run and the re-runs the finalizer hit this 14 times.
+  The 4 retries that wrote recovered; the 10 that did not are exactly
+  the 10 failed test runs. The losing retries came 13 to 238 ms after
+  the write, the winning ones 11 to 31 ms. Closing this race needs the lister to see a write within a few
+  milliseconds of its response, which a resolved-timestamp watermark at
+  10ms does not give.
+
 ## Order of work
 
 0. **Spike, throwaway.** Against a local TiKV + PD in Docker, confirm the
