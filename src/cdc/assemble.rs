@@ -35,13 +35,16 @@ impl Assembler {
             return Ok(None);
         }
         match LogType::try_from(row.r#type) {
-            Ok(LogType::Committed) => build_event(
-                &row.key,
-                row.commit_ts,
-                &row.value,
-                &row.old_value,
-                row.op_type,
-            ),
+            Ok(LogType::Committed) => {
+                self.prewrites.remove(&(row.key.clone(), row.start_ts));
+                build_event(
+                    &row.key,
+                    row.commit_ts,
+                    &row.value,
+                    &row.old_value,
+                    row.op_type,
+                )
+            }
             Ok(LogType::Prewrite) => {
                 let held = HeldPrewrite {
                     value: row.value,
@@ -69,12 +72,17 @@ impl Assembler {
         }
     }
 
-    pub fn forget_region_prewrites(&mut self, keys_in: &(Vec<u8>, Vec<u8>)) {
-        let (start, end) = keys_in;
-        self.prewrites.retain(|(key, _), _| {
-            let in_range = key >= start && (end.is_empty() || key < end);
-            !in_range
-        });
+    pub fn is_unmatched_commit(&self, row: &Row) -> bool {
+        row.r#type == LogType::Commit as i32
+            && keys::etcd_key(&row.key).is_some()
+            && !self
+                .prewrites
+                .contains_key(&(row.key.clone(), row.start_ts))
+    }
+
+    pub fn prune_prewrites_below(&mut self, watermark: u64) {
+        self.prewrites
+            .retain(|(_, start_ts), _| *start_ts >= watermark);
     }
 }
 
@@ -264,34 +272,57 @@ mod tests {
     }
 
     #[test]
-    fn forget_region_prewrites_drops_only_keys_in_range() {
+    fn committed_row_clears_a_held_prewrite() {
         let mut assembler = Assembler::new();
-        for key in [&b"a"[..], b"m"] {
+        let prewrite = with_values(
+            row(LogType::Prewrite, OpType::Put, b"a", 5, 0),
+            Some(&record(1, b"v")),
+            None,
+        );
+        assembler.on_row(prewrite).unwrap();
+        let committed = with_values(
+            row(LogType::Committed, OpType::Put, b"a", 5, 9),
+            Some(&record(1, b"v")),
+            None,
+        );
+        assert!(assembler.on_row(committed).unwrap().is_some());
+        let commit = row(LogType::Commit, OpType::Put, b"a", 5, 9);
+        assert!(assembler.is_unmatched_commit(&commit));
+        assert_eq!(assembler.on_row(commit).unwrap(), None);
+    }
+
+    #[test]
+    fn prune_drops_only_prewrites_strictly_below_the_watermark() {
+        let mut assembler = Assembler::new();
+        for start_ts in [5, 10, 15] {
             let prewrite = with_values(
-                row(LogType::Prewrite, OpType::Put, key, 5, 0),
+                row(LogType::Prewrite, OpType::Put, b"a", start_ts, 0),
                 Some(&record(1, b"v")),
                 None,
             );
             assembler.on_row(prewrite).unwrap();
         }
-        assembler.forget_region_prewrites(&(keys::data_key(b"a"), keys::data_key(b"b")));
-        let commit_a = row(LogType::Commit, OpType::Put, b"a", 5, 12);
-        assert_eq!(assembler.on_row(commit_a).unwrap(), None);
-        let commit_m = row(LogType::Commit, OpType::Put, b"m", 5, 12);
-        assert!(assembler.on_row(commit_m).unwrap().is_some());
+        assembler.prune_prewrites_below(10);
+        let commit = |start_ts| row(LogType::Commit, OpType::Put, b"a", start_ts, 20);
+        assert!(assembler.is_unmatched_commit(&commit(5)));
+        assert!(!assembler.is_unmatched_commit(&commit(10)));
+        assert!(!assembler.is_unmatched_commit(&commit(15)));
     }
 
     #[test]
-    fn forget_region_prewrites_with_empty_end_is_unbounded() {
+    fn only_a_commit_with_no_held_prewrite_under_the_data_prefix_is_unmatched() {
         let mut assembler = Assembler::new();
         let prewrite = with_values(
-            row(LogType::Prewrite, OpType::Put, b"z", 5, 0),
+            row(LogType::Prewrite, OpType::Put, b"a", 5, 0),
             Some(&record(1, b"v")),
             None,
         );
         assembler.on_row(prewrite).unwrap();
-        assembler.forget_region_prewrites(&(keys::data_key(b"a"), Vec::new()));
-        let commit = row(LogType::Commit, OpType::Put, b"z", 5, 12);
-        assert_eq!(assembler.on_row(commit).unwrap(), None);
+        assert!(!assembler.is_unmatched_commit(&row(LogType::Commit, OpType::Put, b"a", 5, 9)));
+        assert!(assembler.is_unmatched_commit(&row(LogType::Commit, OpType::Put, b"b", 5, 9)));
+        let mut outside = row(LogType::Commit, OpType::Put, b"b", 5, 9);
+        outside.key = b"l/b".to_vec();
+        assert!(!assembler.is_unmatched_commit(&outside));
+        assert!(!assembler.is_unmatched_commit(&row(LogType::Committed, OpType::Put, b"b", 5, 9)));
     }
 }

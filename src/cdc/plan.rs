@@ -71,6 +71,14 @@ pub fn plan_replacement(
     }
 }
 
+pub fn is_older_than_tracked(tracked: &BTreeMap<u64, Coverage>, fresh: &[FreshRegion]) -> bool {
+    fresh.iter().any(|region| {
+        tracked.values().any(|known| {
+            overlaps(&known.range, &region.range) && region.epoch.version < known.epoch.version
+        })
+    })
+}
+
 fn is_live_at(region: Option<&Coverage>, epoch: &RegionEpoch) -> bool {
     region.is_some_and(|region| region.live && region.epoch == *epoch)
 }
@@ -291,6 +299,18 @@ mod tests {
                 registered: vec![(6, 42)],
             }
         );
+    }
+
+    #[test]
+    fn a_result_older_than_an_overlapping_tracked_region_is_stale() {
+        let regions = BTreeMap::from([
+            (5, tracked("a", "m", 3, 300, false)),
+            (2, tracked("m", "z", 3, 300, true)),
+        ]);
+        assert!(is_older_than_tracked(&regions, &[fresh(5, "a", "q", 2)]));
+        assert!(!is_older_than_tracked(&regions, &[fresh(5, "a", "q", 4)]));
+        assert!(!is_older_than_tracked(&regions, &[fresh(5, "a", "m", 3)]));
+        assert!(!is_older_than_tracked(&regions, &[fresh(7, "z", "zz", 1)]));
     }
 
     #[test]

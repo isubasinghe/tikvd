@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Duration;
 
 use tikv_client::RegionRoute;
@@ -10,7 +10,10 @@ use tikv_client::proto::metapb::RegionEpoch;
 use tracing::{debug, warn};
 
 use super::encoding::memcomparable_key;
-use super::plan::{Coverage, FreshRegion, KeyRange, fresh_region, is_covered, plan_replacement};
+use super::plan::{
+    Coverage, FreshRegion, KeyRange, fresh_region, is_covered, is_older_than_tracked,
+    plan_replacement,
+};
 use super::{Assembler, ChangeEvent, Sorter};
 use crate::keys::data_range;
 
@@ -65,6 +68,8 @@ struct Registration {
     request_id: u64,
     stream: u64,
     initialized: bool,
+    early_commits: Vec<Row>,
+    scanned_commits: HashSet<(Vec<u8>, u64)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -176,12 +181,22 @@ impl Session {
             self.look_up_later(range, attempt + 1);
             return self.take_actions();
         }
+        if is_older_than_tracked(&self.coverage(), &fresh) {
+            warn!(
+                attempt,
+                "cdc region lookup is older than what is tracked, retrying"
+            );
+            self.look_up_later(range, attempt + 1);
+            return self.take_actions();
+        }
         self.replace_regions(&fresh, attempt);
         self.take_actions()
     }
 
     pub fn on_tick(&mut self) -> Vec<Action> {
         let (events, watermark) = self.sorter.drain();
+        self.assembler
+            .prune_prewrites_below(u64::try_from(watermark).unwrap_or(0));
         if let Some(output) = release(events, watermark, self.config.floor, self.last_emitted) {
             self.last_emitted = Some(watermark);
             self.actions.push(Action::Emit(output));
@@ -259,15 +274,77 @@ impl Session {
 
     fn on_row(&mut self, region_id: u64, row: Row) -> Result<(), SorterFullError> {
         if row.r#type == LogType::Initialized as i32 {
-            if let Some(region) = self.tracked.get_mut(&region_id) {
-                region.failures = 0;
-                if let Some(registration) = region.registration.as_mut() {
-                    registration.initialized = true;
-                }
-            }
+            return self.on_initialized(region_id);
+        }
+        if self.assembler.is_unmatched_commit(&row) {
+            self.on_unmatched_commit(region_id, row);
             return Ok(());
         }
+        if row.r#type == LogType::Committed as i32 {
+            self.note_scanned_commit(region_id, &row);
+        }
         self.assemble(region_id, row)
+    }
+
+    fn on_initialized(&mut self, region_id: u64) -> Result<(), SorterFullError> {
+        let region = self.current_region(region_id);
+        let checkpoint = region.checkpoint;
+        let registration = region.registration.as_mut().expect("current registration");
+        registration.initialized = true;
+        let early_commits = std::mem::take(&mut registration.early_commits);
+        let scanned_commits = std::mem::take(&mut registration.scanned_commits);
+        for row in early_commits {
+            if !self.assembler.is_unmatched_commit(&row) {
+                self.assemble(region_id, row)?;
+                continue;
+            }
+            let seen_committed = scanned_commits.contains(&(row.key.clone(), row.start_ts));
+            if row.commit_ts > checkpoint && !seen_committed {
+                warn!(
+                    region_id,
+                    "a commit seen during the scan has no prewrite, re-registering"
+                );
+                self.lose_registration(region_id);
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    fn on_unmatched_commit(&mut self, region_id: u64, row: Row) {
+        let region = self.current_region(region_id);
+        if row.commit_ts <= region.checkpoint {
+            return;
+        }
+        let registration = region.registration.as_mut().expect("current registration");
+        if !registration.initialized {
+            registration.early_commits.push(row);
+            return;
+        }
+        warn!(
+            region_id,
+            "a commit arrived with no prewrite, re-registering"
+        );
+        self.lose_registration(region_id);
+    }
+
+    fn note_scanned_commit(&mut self, region_id: u64, row: &Row) {
+        let registration = self
+            .current_region(region_id)
+            .registration
+            .as_mut()
+            .expect("current registration");
+        if !registration.initialized {
+            registration
+                .scanned_commits
+                .insert((row.key.clone(), row.start_ts));
+        }
+    }
+
+    fn current_region(&mut self, region_id: u64) -> &mut Region {
+        self.tracked
+            .get_mut(&region_id)
+            .expect("rows come only from a tracked region's current registration")
     }
 
     fn assemble(&mut self, region_id: u64, row: Row) -> Result<(), SorterFullError> {
@@ -296,6 +373,7 @@ impl Session {
             .expect("registration implies tracked");
         region.checkpoint = region.checkpoint.max(ts);
         region.reported = Some(ts);
+        region.failures = 0;
         self.sorter.set_resolved(region_id, ts);
     }
 
@@ -335,12 +413,7 @@ impl Session {
             .map(|region| region.checkpoint)
             .min()
             .unwrap_or(self.config.floor);
-        let coverage: BTreeMap<u64, Coverage> = self
-            .tracked
-            .iter()
-            .map(|(id, region)| (*id, region.coverage()))
-            .collect();
-        let plan = plan_replacement(&coverage, fresh, fallback);
+        let plan = plan_replacement(&self.coverage(), fresh, fallback);
         let superseded: Vec<u64> = plan
             .dropped
             .iter()
@@ -374,9 +447,15 @@ impl Session {
         let reset: Vec<u64> = plan.registered.iter().map(|(id, _)| *id).collect();
         reset_sorter_regions(&mut self.sorter, &all, &reset);
         for region in fresh.iter().filter(|f| reset.contains(&f.id)) {
-            self.assembler.forget_region_prewrites(&region.range);
             self.register(region.id, &region.store_address);
         }
+    }
+
+    fn coverage(&self) -> BTreeMap<u64, Coverage> {
+        self.tracked
+            .iter()
+            .map(|(id, region)| (*id, region.coverage()))
+            .collect()
     }
 
     fn register(&mut self, region_id: u64, store_address: &str) {
@@ -398,6 +477,8 @@ impl Session {
             request_id,
             stream,
             initialized: false,
+            early_commits: Vec::new(),
+            scanned_commits: HashSet::new(),
         });
         self.actions.push(Action::Register {
             stream,
@@ -458,7 +539,7 @@ fn registration_request(
         header: Some(header(cluster_id)),
         region_id,
         region_epoch: Some(region.epoch.clone()),
-        checkpoint_ts: region.checkpoint,
+        checkpoint_ts: region.checkpoint.saturating_sub(1),
         start_key: memcomparable_key(&region.range.0),
         end_key: memcomparable_key(&region.range.1),
         request_id,
@@ -643,5 +724,407 @@ mod tests {
         assert_eq!(retry_delay(1), FIRST_RETRY * 2);
         assert!(retry_delay(3) > retry_delay(2));
         assert_eq!(retry_delay(40), LONGEST_RETRY);
+    }
+
+    use crate::keys::data_key;
+    use tikv_client::proto::cdcpb::event::Entries;
+    use tikv_client::proto::cdcpb::event::row::OpType;
+    use tikv_client::proto::cdcpb::{Error as CdcError, ResolvedTs};
+    use tikv_client::proto::metapb::Region as MetaRegion;
+
+    const STORE: &str = "tikv:20160";
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct Reg {
+        region_id: u64,
+        request_id: u64,
+        stream: u64,
+        checkpoint: u64,
+    }
+
+    fn session(floor: u64) -> Session {
+        Session::new(SessionConfig {
+            floor,
+            cluster_id: 1,
+            sorter_memory_limit: 1 << 20,
+            stalled_lock_threshold: Duration::from_secs(5),
+        })
+        .0
+    }
+
+    fn raw(key: &str) -> Vec<u8> {
+        if key.is_empty() {
+            Vec::new()
+        } else {
+            data_key(key.as_bytes())
+        }
+    }
+
+    fn route(id: u64, start: &str, end: &str, version: u64) -> RegionRoute {
+        RegionRoute {
+            region: MetaRegion {
+                id,
+                start_key: raw(start),
+                end_key: if end == "~" { b"k0".to_vec() } else { raw(end) },
+                region_epoch: Some(RegionEpoch {
+                    conf_ver: 1,
+                    version,
+                }),
+                ..Default::default()
+            },
+            leader: Default::default(),
+            store_address: STORE.to_owned(),
+        }
+    }
+
+    fn registrations(actions: &[Action]) -> Vec<Reg> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Register {
+                    stream, request, ..
+                } => Some(Reg {
+                    region_id: request.region_id,
+                    request_id: request.request_id,
+                    stream: *stream,
+                    checkpoint: request.checkpoint_ts,
+                }),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn looked_up(actions: &[Action]) -> Vec<KeyRange> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::LookUp { range, .. } => Some(range.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn deregistered(actions: &[Action]) -> Vec<u64> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Deregister { request, .. } => Some(request.region_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn emitted(actions: &[Action]) -> Vec<(Vec<ChangeEvent>, i64)> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Emit(FeedOutput::Events { events, watermark }) => {
+                    Some((events.clone(), *watermark))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn single(reg: &Reg, event: RegionEventKind) -> ChangeDataEvent {
+        ChangeDataEvent {
+            events: vec![RegionEvent {
+                region_id: reg.region_id,
+                request_id: reg.request_id,
+                event: Some(event),
+                ..Default::default()
+            }],
+            resolved_ts: None,
+        }
+    }
+
+    fn rows(reg: &Reg, rows: Vec<Row>) -> ChangeDataEvent {
+        single(reg, RegionEventKind::Entries(Entries { entries: rows }))
+    }
+
+    fn resolved(reg: &Reg, ts: u64) -> ChangeDataEvent {
+        single(reg, RegionEventKind::ResolvedTs(ts))
+    }
+
+    fn batch_resolved(reg: &Reg, ts: u64) -> ChangeDataEvent {
+        ChangeDataEvent {
+            events: vec![],
+            resolved_ts: Some(ResolvedTs {
+                regions: vec![reg.region_id],
+                ts,
+                request_id: reg.request_id,
+            }),
+        }
+    }
+
+    fn region_error(reg: &Reg) -> ChangeDataEvent {
+        single(reg, RegionEventKind::Error(CdcError::default()))
+    }
+
+    fn value(text: &str) -> Vec<u8> {
+        Record {
+            version: 1,
+            created: 1,
+            lease_expiry: 0,
+            value: text.as_bytes().to_vec(),
+        }
+        .encode()
+    }
+
+    fn row(log_type: LogType, key: &str, start_ts: u64, commit_ts: u64) -> Row {
+        Row {
+            r#type: log_type as i32,
+            op_type: OpType::Put as i32,
+            key: raw(key),
+            start_ts,
+            commit_ts,
+            ..Default::default()
+        }
+    }
+
+    fn prewrite(key: &str, start_ts: u64) -> Row {
+        Row {
+            value: value("v"),
+            ..row(LogType::Prewrite, key, start_ts, 0)
+        }
+    }
+
+    fn commit(key: &str, start_ts: u64, commit_ts: u64) -> Row {
+        row(LogType::Commit, key, start_ts, commit_ts)
+    }
+
+    fn committed(key: &str, start_ts: u64, commit_ts: u64) -> Row {
+        Row {
+            value: value("v"),
+            ..row(LogType::Committed, key, start_ts, commit_ts)
+        }
+    }
+
+    fn initialized() -> Row {
+        row(LogType::Initialized, "", 0, 0)
+    }
+
+    fn keyed(events: &[(Vec<ChangeEvent>, i64)]) -> Vec<(Vec<u8>, i64)> {
+        events
+            .iter()
+            .flat_map(|(events, _)| events.iter().map(|e| (e.key.clone(), e.revision)))
+            .collect()
+    }
+
+    fn watermarks(events: &[(Vec<ChangeEvent>, i64)]) -> Vec<i64> {
+        events.iter().map(|(_, watermark)| *watermark).collect()
+    }
+
+    fn register_one(session: &mut Session, route: RegionRoute) -> Reg {
+        let range = clamp_raw(&route);
+        let actions = session.on_lookup(range, 0, Ok(vec![route]));
+        registrations(&actions).remove(0)
+    }
+
+    fn clamp_raw(route: &RegionRoute) -> KeyRange {
+        fresh_region(&watched_range(), route.clone()).unwrap().range
+    }
+
+    fn live(session: &mut Session, reg: &Reg, ts: u64) {
+        session.on_change_data(reg.stream, rows(reg, vec![initialized()]));
+        session.on_change_data(reg.stream, resolved(reg, ts));
+    }
+
+    #[test]
+    fn commit_before_prewrite_during_scan_is_not_lost() {
+        let mut session = session(100);
+        let reg = register_one(&mut session, route(1, "", "~", 1));
+
+        session.on_change_data(reg.stream, rows(&reg, vec![commit("x", 150, 200)]));
+        let mut out = emitted(&session.on_tick());
+        session.on_change_data(reg.stream, rows(&reg, vec![prewrite("x", 150)]));
+        out.extend(emitted(&session.on_tick()));
+        session.on_change_data(reg.stream, rows(&reg, vec![initialized()]));
+        out.extend(emitted(&session.on_tick()));
+        session.on_change_data(reg.stream, resolved(&reg, 300));
+        out.extend(emitted(&session.on_tick()));
+
+        assert_eq!(keyed(&out), vec![(b"x".to_vec(), 200)]);
+        let first_past_commit = out.iter().position(|(_, w)| *w >= 200).unwrap();
+        assert!(!out[first_past_commit].0.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn unmatched_commit_after_initialized_triggers_reregistration() {
+        let mut session = session(100);
+        let reg = register_one(&mut session, route(1, "", "~", 1));
+        live(&mut session, &reg, 150);
+
+        let actions = session.on_change_data(reg.stream, rows(&reg, vec![commit("y", 160, 200)]));
+        assert_eq!(deregistered(&actions), vec![1]);
+        assert_eq!(looked_up(&actions), vec![clamp_raw(&route(1, "", "~", 1))]);
+
+        let again = register_one(&mut session, route(1, "", "~", 1));
+        assert_eq!(again.checkpoint, 149);
+        session.on_change_data(again.stream, rows(&again, vec![committed("y", 160, 200)]));
+        live(&mut session, &again, 300);
+        assert_eq!(
+            keyed(&emitted(&session.on_tick())),
+            vec![(b"y".to_vec(), 200)]
+        );
+    }
+
+    #[test]
+    fn stale_resolved_ts_from_previous_registration_is_ignored() {
+        let mut session = session(100);
+        let old = register_one(&mut session, route(1, "", "~", 1));
+        live(&mut session, &old, 150);
+        session.on_tick();
+        session.on_change_data(old.stream, region_error(&old));
+        let new = register_one(&mut session, route(1, "", "~", 1));
+
+        session.on_change_data(old.stream, resolved(&old, 900));
+        session.on_change_data(old.stream, batch_resolved(&old, 900));
+        assert!(emitted(&session.on_tick()).is_empty());
+
+        live(&mut session, &new, 200);
+        assert_eq!(watermarks(&emitted(&session.on_tick())), vec![200]);
+    }
+
+    #[test]
+    fn resolved_ts_before_initialized_is_ignored() {
+        let mut session = session(100);
+        let reg = register_one(&mut session, route(1, "", "~", 1));
+        session.on_change_data(reg.stream, resolved(&reg, 500));
+        session.on_change_data(reg.stream, batch_resolved(&reg, 500));
+        assert!(emitted(&session.on_tick()).is_empty());
+
+        live(&mut session, &reg, 200);
+        assert_eq!(watermarks(&emitted(&session.on_tick())), vec![200]);
+    }
+
+    fn two_regions(session: &mut Session) -> (Reg, Reg) {
+        let left = route(5, "", "m", 3);
+        let right = route(2, "m", "~", 3);
+        let actions = session.on_lookup(watched_range(), 0, Ok(vec![left, right]));
+        let regs = registrations(&actions);
+        let five = regs.iter().find(|r| r.region_id == 5).unwrap().clone();
+        let two = regs.iter().find(|r| r.region_id == 2).unwrap().clone();
+        live(session, &five, 150);
+        live(session, &two, 150);
+        session.on_tick();
+        (five, two)
+    }
+
+    #[test]
+    fn stale_lookup_result_is_discarded() {
+        let mut session = session(100);
+        let (five, two) = two_regions(&mut session);
+        session.on_change_data(five.stream, region_error(&five));
+
+        let stale = route(5, "", "q", 2);
+        let actions = session.on_lookup(clamp_raw(&route(5, "", "m", 3)), 1, Ok(vec![stale]));
+        assert!(registrations(&actions).is_empty(), "{actions:?}");
+        assert!(deregistered(&actions).is_empty(), "{actions:?}");
+        assert_eq!(looked_up(&actions).len(), 1);
+
+        session.on_change_data(two.stream, resolved(&two, 400));
+        assert!(emitted(&session.on_tick()).is_empty());
+    }
+
+    #[test]
+    fn kept_registration_keeps_its_prewrites_across_a_neighbours_reregistration() {
+        let mut session = session(100);
+        let (five, two) = two_regions(&mut session);
+        session.on_change_data(two.stream, rows(&two, vec![prewrite("n", 160)]));
+
+        session.on_change_data(five.stream, region_error(&five));
+        let grown = register_one(&mut session, route(5, "", "q", 4));
+        session.on_change_data(two.stream, rows(&two, vec![commit("n", 160, 200)]));
+        session.on_change_data(two.stream, resolved(&two, 300));
+        live(&mut session, &grown, 300);
+
+        let out = emitted(&session.on_tick());
+        assert_eq!(keyed(&out), vec![(b"n".to_vec(), 200)]);
+    }
+
+    #[test]
+    fn split_never_lets_the_watermark_pass_the_uncovered_half() {
+        let mut session = session(100);
+        let whole = register_one(&mut session, route(1, "", "~", 1));
+        live(&mut session, &whole, 150);
+        assert_eq!(watermarks(&emitted(&session.on_tick())), vec![150]);
+
+        session.on_change_data(whole.stream, region_error(&whole));
+        let actions = session.on_lookup(
+            clamp_raw(&route(1, "", "~", 1)),
+            1,
+            Ok(vec![route(1, "", "m", 2), route(3, "m", "~", 2)]),
+        );
+        let regs = registrations(&actions);
+        let left = regs.iter().find(|r| r.region_id == 1).unwrap().clone();
+        let right = regs.iter().find(|r| r.region_id == 3).unwrap().clone();
+
+        live(&mut session, &left, 500);
+        assert!(emitted(&session.on_tick()).is_empty());
+
+        session.on_change_data(right.stream, rows(&right, vec![committed("z", 290, 300)]));
+        live(&mut session, &right, 500);
+        let out = emitted(&session.on_tick());
+        assert_eq!(keyed(&out), vec![(b"z".to_vec(), 300)]);
+        assert_eq!(watermarks(&out), vec![500]);
+    }
+
+    #[test]
+    fn stream_close_holds_the_watermark_until_reregistered() {
+        let mut session = session(100);
+        let reg = register_one(&mut session, route(1, "", "~", 1));
+        live(&mut session, &reg, 150);
+        session.on_tick();
+
+        let actions = session.on_stream_closed(reg.stream);
+        assert_eq!(looked_up(&actions), vec![clamp_raw(&route(1, "", "~", 1))]);
+        session.on_change_data(reg.stream, resolved(&reg, 900));
+        assert!(emitted(&session.on_tick()).is_empty());
+
+        let again = register_one(&mut session, route(1, "", "~", 1));
+        assert_ne!(again.stream, reg.stream);
+        assert_eq!(again.checkpoint, 149);
+        live(&mut session, &again, 500);
+        assert_eq!(watermarks(&emitted(&session.on_tick())), vec![500]);
+    }
+
+    #[test]
+    fn a_late_prewrite_pruned_below_the_watermark_is_not_lost() {
+        let mut session = session(100);
+        let reg = register_one(&mut session, route(1, "", "~", 1));
+        live(&mut session, &reg, 300);
+        session.on_tick();
+
+        session.on_change_data(reg.stream, rows(&reg, vec![prewrite("w", 200)]));
+        session.on_tick();
+        let actions = session.on_change_data(reg.stream, rows(&reg, vec![commit("w", 200, 400)]));
+        assert_eq!(deregistered(&actions), vec![1]);
+
+        let again = register_one(&mut session, route(1, "", "~", 1));
+        assert_eq!(again.checkpoint, 299);
+        session.on_change_data(again.stream, rows(&again, vec![committed("w", 200, 400)]));
+        live(&mut session, &again, 500);
+        assert_eq!(
+            keyed(&emitted(&session.on_tick())),
+            vec![(b"w".to_vec(), 400)]
+        );
+    }
+
+    #[test]
+    fn a_commit_the_scan_already_delivered_does_not_reregister() {
+        let mut session = session(100);
+        let reg = register_one(&mut session, route(1, "", "~", 1));
+
+        session.on_change_data(reg.stream, rows(&reg, vec![commit("c", 150, 200)]));
+        session.on_change_data(reg.stream, rows(&reg, vec![committed("c", 150, 200)]));
+        let actions = session.on_change_data(reg.stream, rows(&reg, vec![initialized()]));
+        assert!(deregistered(&actions).is_empty(), "{actions:?}");
+
+        session.on_change_data(reg.stream, resolved(&reg, 300));
+        assert_eq!(
+            keyed(&emitted(&session.on_tick())),
+            vec![(b"c".to_vec(), 200)]
+        );
     }
 }
