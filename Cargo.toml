@@ -5,6 +5,10 @@ edition = "2024"
 
 [dependencies]
 tikv-client = { path = "vendor/tikv-client", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio-stream = "0.1"
+tonic = "0.12"
+tracing = "0.1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
