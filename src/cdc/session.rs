@@ -143,6 +143,7 @@ impl Session {
             warn!("cdc sorter is full, resetting the feed");
             return vec![Action::Reset];
         }
+        self.release_ready();
         self.take_actions()
     }
 
@@ -200,15 +201,7 @@ impl Session {
             return self.take_actions();
         }
         self.replace_regions(&fresh, attempt, compact_revision);
-        self.take_actions()
-    }
-
-    pub fn on_tick(&mut self) -> Vec<Action> {
-        let (events, watermark) = self.sorter.drain();
-        if let Some(output) = release(events, watermark, self.config.floor, self.last_emitted) {
-            self.last_emitted = Some(watermark);
-            self.actions.push(Action::Emit(output));
-        }
+        self.release_ready();
         self.take_actions()
     }
 
@@ -230,6 +223,14 @@ impl Session {
 
     fn take_actions(&mut self) -> Vec<Action> {
         std::mem::take(&mut self.actions)
+    }
+
+    fn release_ready(&mut self) {
+        let (events, watermark) = self.sorter.drain();
+        if let Some(output) = release(events, watermark, self.config.floor, self.last_emitted) {
+            self.last_emitted = Some(watermark);
+            self.actions.push(Action::Emit(output));
+        }
     }
 
     fn apply_change_data(
@@ -1008,9 +1009,10 @@ mod tests {
         fresh_region(&watched_range(), route.clone()).unwrap().range
     }
 
-    fn live(session: &mut Session, reg: &Reg, ts: u64) {
-        session.on_change_data(reg.stream, rows(reg, vec![initialized()]));
-        session.on_change_data(reg.stream, resolved(reg, ts));
+    fn live(session: &mut Session, reg: &Reg, ts: u64) -> Vec<Action> {
+        let mut actions = session.on_change_data(reg.stream, rows(reg, vec![initialized()]));
+        actions.extend(session.on_change_data(reg.stream, resolved(reg, ts)));
+        actions
     }
 
     #[test]
@@ -1018,14 +1020,12 @@ mod tests {
         let mut session = session(100);
         let reg = register_one(&mut session, route(1, "", "~", 1));
 
-        session.on_change_data(reg.stream, rows(&reg, vec![commit("x", 150, 200)]));
-        let mut out = emitted(&session.on_tick());
-        session.on_change_data(reg.stream, rows(&reg, vec![prewrite("x", 150)]));
-        out.extend(emitted(&session.on_tick()));
-        session.on_change_data(reg.stream, rows(&reg, vec![initialized()]));
-        out.extend(emitted(&session.on_tick()));
-        session.on_change_data(reg.stream, resolved(&reg, 300));
-        out.extend(emitted(&session.on_tick()));
+        let mut actions =
+            session.on_change_data(reg.stream, rows(&reg, vec![commit("x", 150, 200)]));
+        actions.extend(session.on_change_data(reg.stream, rows(&reg, vec![prewrite("x", 150)])));
+        actions.extend(session.on_change_data(reg.stream, rows(&reg, vec![initialized()])));
+        actions.extend(session.on_change_data(reg.stream, resolved(&reg, 300)));
+        let out = emitted(&actions);
 
         assert_eq!(keyed(&out), vec![(b"x".to_vec(), 200)]);
         let first_past_commit = out.iter().position(|(_, w)| *w >= 200).unwrap();
@@ -1045,9 +1045,8 @@ mod tests {
         let again = register_one(&mut session, route(1, "", "~", 1));
         assert_eq!(again.checkpoint, 149);
         session.on_change_data(again.stream, rows(&again, vec![committed("y", 160, 200)]));
-        live(&mut session, &again, 300);
         assert_eq!(
-            keyed(&emitted(&session.on_tick())),
+            keyed(&emitted(&live(&mut session, &again, 300))),
             vec![(b"y".to_vec(), 200)]
         );
     }
@@ -1057,28 +1056,31 @@ mod tests {
         let mut session = session(100);
         let old = register_one(&mut session, route(1, "", "~", 1));
         live(&mut session, &old, 150);
-        session.on_tick();
         session.on_change_data(old.stream, region_error(&old));
         let new = register_one(&mut session, route(1, "", "~", 1));
 
-        session.on_change_data(old.stream, resolved(&old, 900));
-        session.on_change_data(old.stream, batch_resolved(&old, 900));
-        assert!(emitted(&session.on_tick()).is_empty());
+        let mut actions = session.on_change_data(old.stream, resolved(&old, 900));
+        actions.extend(session.on_change_data(old.stream, batch_resolved(&old, 900)));
+        assert!(emitted(&actions).is_empty(), "{actions:?}");
 
-        live(&mut session, &new, 200);
-        assert_eq!(watermarks(&emitted(&session.on_tick())), vec![200]);
+        assert_eq!(
+            watermarks(&emitted(&live(&mut session, &new, 200))),
+            vec![200]
+        );
     }
 
     #[test]
     fn resolved_ts_before_initialized_is_ignored() {
         let mut session = session(100);
         let reg = register_one(&mut session, route(1, "", "~", 1));
-        session.on_change_data(reg.stream, resolved(&reg, 500));
-        session.on_change_data(reg.stream, batch_resolved(&reg, 500));
-        assert!(emitted(&session.on_tick()).is_empty());
+        let mut actions = session.on_change_data(reg.stream, resolved(&reg, 500));
+        actions.extend(session.on_change_data(reg.stream, batch_resolved(&reg, 500)));
+        assert!(emitted(&actions).is_empty(), "{actions:?}");
 
-        live(&mut session, &reg, 200);
-        assert_eq!(watermarks(&emitted(&session.on_tick())), vec![200]);
+        assert_eq!(
+            watermarks(&emitted(&live(&mut session, &reg, 200))),
+            vec![200]
+        );
     }
 
     fn two_regions(session: &mut Session) -> (Reg, Reg) {
@@ -1094,7 +1096,6 @@ mod tests {
         let two = regs.iter().find(|r| r.region_id == 2).unwrap().clone();
         live(session, &five, resolved_ts);
         live(session, &two, resolved_ts);
-        session.on_tick();
         (five, two)
     }
 
@@ -1110,8 +1111,8 @@ mod tests {
         assert!(deregistered(&actions).is_empty(), "{actions:?}");
         assert_eq!(looked_up(&actions).len(), 1);
 
-        session.on_change_data(two.stream, resolved(&two, 400));
-        assert!(emitted(&session.on_tick()).is_empty());
+        let actions = session.on_change_data(two.stream, resolved(&two, 400));
+        assert!(emitted(&actions).is_empty(), "{actions:?}");
     }
 
     #[test]
@@ -1122,11 +1123,12 @@ mod tests {
 
         session.on_change_data(five.stream, region_error(&five));
         let grown = register_one(&mut session, route(5, "", "q", 4));
-        session.on_change_data(two.stream, rows(&two, vec![commit("n", 160, 200)]));
-        session.on_change_data(two.stream, resolved(&two, 300));
-        live(&mut session, &grown, 300);
+        let mut actions =
+            session.on_change_data(two.stream, rows(&two, vec![commit("n", 160, 200)]));
+        actions.extend(session.on_change_data(two.stream, resolved(&two, 300)));
+        actions.extend(live(&mut session, &grown, 300));
 
-        let out = emitted(&session.on_tick());
+        let out = emitted(&actions);
         assert_eq!(keyed(&out), vec![(b"n".to_vec(), 200)]);
     }
 
@@ -1134,8 +1136,10 @@ mod tests {
     fn split_never_lets_the_watermark_pass_the_uncovered_half() {
         let mut session = session(100);
         let whole = register_one(&mut session, route(1, "", "~", 1));
-        live(&mut session, &whole, 150);
-        assert_eq!(watermarks(&emitted(&session.on_tick())), vec![150]);
+        assert_eq!(
+            watermarks(&emitted(&live(&mut session, &whole, 150))),
+            vec![150]
+        );
 
         session.on_change_data(whole.stream, region_error(&whole));
         let actions = session.on_lookup(
@@ -1147,12 +1151,10 @@ mod tests {
         let left = regs.iter().find(|r| r.region_id == 1).unwrap().clone();
         let right = regs.iter().find(|r| r.region_id == 3).unwrap().clone();
 
-        live(&mut session, &left, 500);
-        assert!(emitted(&session.on_tick()).is_empty());
+        assert!(emitted(&live(&mut session, &left, 500)).is_empty());
 
         session.on_change_data(right.stream, rows(&right, vec![committed("z", 290, 300)]));
-        live(&mut session, &right, 500);
-        let out = emitted(&session.on_tick());
+        let out = emitted(&live(&mut session, &right, 500));
         assert_eq!(keyed(&out), vec![(b"z".to_vec(), 300)]);
         assert_eq!(watermarks(&out), vec![500]);
     }
@@ -1162,18 +1164,19 @@ mod tests {
         let mut session = session(100);
         let reg = register_one(&mut session, route(1, "", "~", 1));
         live(&mut session, &reg, 150);
-        session.on_tick();
 
         let actions = session.on_stream_closed(reg.stream);
         assert_eq!(looked_up(&actions), vec![clamp_raw(&route(1, "", "~", 1))]);
-        session.on_change_data(reg.stream, resolved(&reg, 900));
-        assert!(emitted(&session.on_tick()).is_empty());
+        let actions = session.on_change_data(reg.stream, resolved(&reg, 900));
+        assert!(emitted(&actions).is_empty(), "{actions:?}");
 
         let again = register_one(&mut session, route(1, "", "~", 1));
         assert_ne!(again.stream, reg.stream);
         assert_eq!(again.checkpoint, 149);
-        live(&mut session, &again, 500);
-        assert_eq!(watermarks(&emitted(&session.on_tick())), vec![500]);
+        assert_eq!(
+            watermarks(&emitted(&live(&mut session, &again, 500))),
+            vec![500]
+        );
     }
 
     fn reregistered(actions: &[Action]) -> bool {
@@ -1198,13 +1201,11 @@ mod tests {
         for ts in [110, 120, 130] {
             actions.extend(session.on_change_data(five.stream, resolved(&five, 100)));
             actions.extend(session.on_change_data(two.stream, resolved(&two, ts)));
-            actions.extend(session.on_tick());
         }
         actions
             .extend(session.on_change_data(five.stream, rows(&five, vec![commit("a", 50, 150)])));
         actions.extend(session.on_change_data(five.stream, resolved(&five, 200)));
         actions.extend(session.on_change_data(two.stream, resolved(&two, 200)));
-        actions.extend(session.on_tick());
 
         assert_eq!(keyed(&emitted(&actions)), vec![(b"a".to_vec(), 150)]);
         assert!(!reregistered(&actions), "{actions:?}");
@@ -1215,17 +1216,14 @@ mod tests {
         let mut session = session(10);
         let reg = register_one(&mut session, route(1, "", "~", 1));
         live(&mut session, &reg, 100);
-        session.on_tick();
         let mut actions = Vec::new();
 
         actions.extend(session.on_change_data(reg.stream, rows(&reg, vec![prewrite("a", 50)])));
         for _ in 0..10 {
             actions.extend(session.on_change_data(reg.stream, resolved(&reg, 100)));
-            actions.extend(session.on_tick());
         }
         actions.extend(session.on_change_data(reg.stream, rows(&reg, vec![commit("a", 50, 150)])));
         actions.extend(session.on_change_data(reg.stream, resolved(&reg, 200)));
-        actions.extend(session.on_tick());
 
         assert_eq!(keyed(&emitted(&actions)), vec![(b"a".to_vec(), 150)]);
         assert!(!reregistered(&actions), "{actions:?}");
@@ -1249,7 +1247,6 @@ mod tests {
         live(&mut session, &reg, 40);
         session.on_change_data(reg.stream, rows(&reg, vec![prewrite("a", 50)]));
         session.on_change_data(reg.stream, resolved(&reg, 60));
-        session.on_tick();
         assert!(holds(&session, "a", 50));
     }
 
@@ -1261,14 +1258,14 @@ mod tests {
         for ts in [250, 300] {
             session.on_change_data(five.stream, resolved(&five, 200));
             session.on_change_data(two.stream, resolved(&two, ts));
-            session.on_tick();
         }
         assert!(holds(&session, "a", 50));
 
         session.on_change_data(five.stream, rows(&five, vec![commit("a", 50, 250)]));
-        session.on_change_data(five.stream, resolved(&five, 300));
         assert_eq!(
-            keyed(&emitted(&session.on_tick())),
+            keyed(&emitted(
+                &session.on_change_data(five.stream, resolved(&five, 300))
+            )),
             vec![(b"a".to_vec(), 250)]
         );
     }
@@ -1291,6 +1288,35 @@ mod tests {
     }
 
     #[test]
+    fn a_resolved_ts_that_raises_the_minimum_releases_from_that_message() {
+        let mut session = session(100);
+        let reg = register_one(&mut session, route(1, "", "~", 1));
+        session.on_change_data(reg.stream, rows(&reg, vec![initialized()]));
+        session.on_change_data(reg.stream, rows(&reg, vec![prewrite("x", 150)]));
+        session.on_change_data(reg.stream, rows(&reg, vec![commit("x", 150, 200)]));
+
+        let out = emitted(&session.on_change_data(reg.stream, resolved(&reg, 300)));
+        assert_eq!(keyed(&out), vec![(b"x".to_vec(), 200)]);
+        assert_eq!(watermarks(&out), vec![300]);
+    }
+
+    #[test]
+    fn a_resolved_ts_that_leaves_the_minimum_unmoved_releases_nothing() {
+        let mut session = session(100);
+        let (five, two) = two_regions(&mut session);
+        session.on_change_data(five.stream, rows(&five, vec![prewrite("a", 160)]));
+        session.on_change_data(five.stream, rows(&five, vec![commit("a", 160, 200)]));
+
+        let mut actions = session.on_change_data(five.stream, resolved(&five, 300));
+        actions.extend(session.on_change_data(two.stream, resolved(&two, 150)));
+        assert!(emitted(&actions).is_empty(), "{actions:?}");
+
+        let out = emitted(&session.on_change_data(two.stream, resolved(&two, 250)));
+        assert_eq!(keyed(&out), vec![(b"a".to_vec(), 200)]);
+        assert_eq!(watermarks(&out), vec![250]);
+    }
+
+    #[test]
     fn a_commit_the_scan_already_delivered_does_not_reregister() {
         let mut session = session(100);
         let reg = register_one(&mut session, route(1, "", "~", 1));
@@ -1300,9 +1326,10 @@ mod tests {
         let actions = session.on_change_data(reg.stream, rows(&reg, vec![initialized()]));
         assert!(deregistered(&actions).is_empty(), "{actions:?}");
 
-        session.on_change_data(reg.stream, resolved(&reg, 300));
         assert_eq!(
-            keyed(&emitted(&session.on_tick())),
+            keyed(&emitted(
+                &session.on_change_data(reg.stream, resolved(&reg, 300))
+            )),
             vec![(b"c".to_vec(), 200)]
         );
     }
