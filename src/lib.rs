@@ -5,3 +5,5 @@ pub mod pb;
 pub mod record;
 pub mod server;
 pub mod store;
+pub mod watch_hub;
+pub mod watch_service;

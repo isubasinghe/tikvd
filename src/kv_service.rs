@@ -386,7 +386,7 @@ fn require_key(key: &[u8]) -> Result<(), Status> {
     Ok(())
 }
 
-fn unsupported(shape: &str) -> Status {
+pub(crate) fn unsupported(shape: &str) -> Status {
     warn!(shape, "unsupported request");
     Status::unimplemented(format!("unsupported: {shape}"))
 }
@@ -400,7 +400,7 @@ fn status(error: StoreError) -> Status {
     }
 }
 
-fn header(revision: i64) -> ResponseHeader {
+pub(crate) fn header(revision: i64) -> ResponseHeader {
     ResponseHeader {
         cluster_id: CLUSTER_ID,
         member_id: MEMBER_ID,
