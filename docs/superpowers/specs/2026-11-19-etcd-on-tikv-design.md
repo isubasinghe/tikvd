@@ -155,6 +155,15 @@ of order.
 Consequences:
 
 - A write's response revision is the timestamp returned by `commit`.
+- A revision identifies exactly one transaction. Writes therefore use
+  ordinary two-phase commit, whose commit timestamp comes from PD's
+  timestamp oracle and is never issued twice. One-phase and async commit
+  must not be used: TiKV computes their commit timestamp locally, and two
+  transactions on different keys can share it (observed: 50 concurrent
+  writes produced 23 distinct timestamps). A watcher resuming at the next
+  revision would then lose an event.
+- Several events share a revision only when they come from one transaction
+  (a range delete). They are delivered to a watcher in one response.
 - A key's `mod_revision` is the commit timestamp of its latest version,
   read back with `need_commit_ts`. It is never stored in the value, because
   it is not known until after commit.
@@ -177,6 +186,7 @@ bounded.
 `created` otherwise. `created` is always lower than any later commit, so
 the two are equal exactly on a create.
 - `l/<expiry, big-endian>/<etcd key>` → empty. TTL index for the reaper.
+- `m/compact` → the compaction revision, big-endian. See Compaction.
 
 An etcd delete is a TiKV delete. There is no tombstone record.
 
@@ -198,9 +208,8 @@ Supported requests, matching what kube-apiserver sends:
 - Bare `Put` and single-key or range `DeleteRange`.
 - `Compact`.
 
-A write runs as an optimistic TiKV transaction with one-phase commit
-requested: read the key with its commit timestamp, evaluate the compare,
-write, commit. TiKV's own write-conflict check makes the compare-and-write
+A write runs as an optimistic two-phase TiKV transaction: read the key with
+its commit timestamp, evaluate the compare, write, commit. TiKV's own write-conflict check makes the compare-and-write
 atomic. On write conflict the whole operation is retried from the read, so
 the compare is re-evaluated against the new state. A put with a lease also
 writes the TTL index key, and removes the old index key if the expiry
@@ -214,8 +223,8 @@ Each `tikvd` instance runs one CDC consumer covering the `k/` range:
    stream per store, registering each region from a `checkpoint_ts` taken
    at startup.
 2. Turn rows into committed events. A `COMMITTED` row is complete on its
-   own; one-phase commits and incremental-scan rows arrive this way, so
-   this is the main path. A `PREWRITE` row (which carries the value and
+   own; incremental-scan rows arrive this way. Live writes are two-phase,
+   so the main path is the pair: a `PREWRITE` row (which carries the value and
    the old value) is held until its `COMMIT` row (which carries only the
    commit timestamp) with the same key and start timestamp arrives, and
    dropped on `ROLLBACK`. `INITIALIZED` marks the end of a region's
@@ -243,8 +252,8 @@ Each `tikvd` instance runs one CDC consumer covering the `k/` range:
 A stalled watermark is safe: watches and progress notifications pause, and
 nothing wrong is delivered. An instance whose watermark has been stalled
 past a second threshold reports not serving. If the sorter exceeds its
-memory bound, or TiKV rejects a registration because GC has passed its
-checkpoint, the instance cancels all its watches with etcd's compacted
+memory bound, or a registration's checkpoint is below the compaction
+revision (TiKV v8.5.6 does not report this itself), the instance cancels all its watches with etcd's compacted
 error and restarts its subscription from a fresh timestamp.
 
 A client watch with start revision R:
@@ -272,8 +281,19 @@ by kube-apiserver and return `UNIMPLEMENTED`.
 
 ### Compaction
 
-`Compact(R)` advances TiKV's GC safepoint to R. Reads below the safepoint
-map TiKV's error to etcd's compacted error.
+TiKV is not relied on to reject a read below its GC safepoint, so `tikvd`
+keeps its own compaction revision in `m/compact`.
+
+- `Compact(R)` rejects a non-positive R as compacted and an R above the
+  current timestamp as a future revision. Otherwise it reads the previous
+  compaction revision P, writes R to `m/compact` if R is higher, and then
+  advances TiKV's GC safepoint to P, not to R.
+- GC therefore runs one compaction behind. A read that passed the check
+  just before a compaction has a whole compaction interval (five minutes
+  under kube-apiserver) before its data can be collected.
+- A read at an explicit revision reads `m/compact` at a fresh timestamp and
+  returns etcd's compacted error if its revision is below it. A read "now"
+  needs no check.
 
 ### Maintenance and serving
 
