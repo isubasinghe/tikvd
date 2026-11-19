@@ -1193,6 +1193,7 @@ mod tests {
 
         actions.extend(session.on_change_data(five.stream, rows(&five, vec![prewrite("a", 50)])));
         for ts in [110, 120, 130] {
+            actions.extend(session.on_change_data(five.stream, resolved(&five, 100)));
             actions.extend(session.on_change_data(two.stream, resolved(&two, ts)));
             actions.extend(session.on_tick());
         }
@@ -1255,6 +1256,7 @@ mod tests {
         let (five, two) = two_regions_at(&mut session, 200);
         session.on_change_data(five.stream, rows(&five, vec![prewrite("a", 50)]));
         for ts in [250, 300] {
+            session.on_change_data(five.stream, resolved(&five, 200));
             session.on_change_data(two.stream, resolved(&two, ts));
             session.on_tick();
         }
@@ -1274,17 +1276,14 @@ mod tests {
         let old = register_one(&mut session, route(1, "", "~", 1));
         live(&mut session, &old, 100);
         session.on_change_data(old.stream, rows(&old, vec![prewrite("a", 150)]));
-        session.on_change_data(old.stream, resolved(&old, 140));
+        session.on_change_data(old.stream, resolved(&old, 160));
         session.on_change_data(old.stream, region_error(&old));
 
         let new = register_one(&mut session, route(1, "", "~", 1));
-        session.on_change_data(
-            new.stream,
-            rows(&new, vec![prewrite("a", 150), initialized()]),
-        );
-        session.on_change_data(new.stream, resolved(&new, 160));
-        assert!(holds(&session, "a", 150));
+        session.on_change_data(new.stream, rows(&new, vec![initialized()]));
         session.on_change_data(new.stream, resolved(&new, 170));
+        assert!(holds(&session, "a", 150));
+        session.on_change_data(new.stream, resolved(&new, 180));
         assert!(!holds(&session, "a", 150));
     }
 
