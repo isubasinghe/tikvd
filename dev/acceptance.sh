@@ -50,16 +50,17 @@ collect_cluster_logs() {
 
 cleanup() {
     local status=$?
+    set +e
     collect_cluster_logs
     if [[ $KEEP == 1 ]]; then
         say "KEEP=1: leaving cluster $CLUSTER_NAME and tikvd running (logs in $WORK_DIR)"
         exit "$status"
     fi
-    k3d cluster delete "$CLUSTER_NAME" >/dev/null 2>&1 || true
+    k3d cluster delete "$CLUSTER_NAME" >/dev/null 2>&1 || say "cleanup: could not delete k3d cluster $CLUSTER_NAME"
     for port in "${TIKVD_PORTS[@]}"; do
-        stop_tikvd "$port"
+        stop_tikvd "$port" || say "cleanup: could not stop tikvd on :$port"
     done
-    remove_own_network
+    remove_own_network || say "cleanup: could not remove network $CLUSTER_NETWORK"
     exit "$status"
 }
 
@@ -318,10 +319,27 @@ report_feed_resets() {
     done
 }
 
+consistency_check_samples() {
+    kubectl get --raw /metrics 2>/dev/null | grep '^apiserver_storage_consistency_checks_total' || true
+}
+
 report_cache_inconsistency() {
-    if grep "Cache consistency check" "$WORK_DIR/k3s.log" >&2; then
+    local samples runs unsuccessful
+    if grep -E "Cache consistency check (failed|error)" "$WORK_DIR/k3s.log" >&2; then
         fail "kube-apiserver reported a cache consistency check failure (above)"
     fi
+    samples=$(consistency_check_samples)
+    runs=$(awk '{ total += $NF } END { printf "%d", total }' <<<"$samples")
+    unsuccessful=$(awk '!/status="success"/ { total += $NF } END { printf "%d", total }' <<<"$samples")
+    if ((runs == 0)) && ! grep -qE "Cache consistency check (start|passed)" "$WORK_DIR/k3s.log"; then
+        say "cache consistency gate SKIPPED: kube-apiserver's checker has not run yet (no apiserver_storage_consistency_checks_total samples, no checker lines in its log); it runs every 5 minutes, so raise SOAK_SECS to have it asserted"
+        return 0
+    fi
+    if ((unsuccessful > 0)); then
+        echo "$samples" >&2
+        fail "kube-apiserver's cache consistency checker reported $unsuccessful unsuccessful checks (above)"
+    fi
+    say "cache consistency gate ASSERTED: kube-apiserver's checker ran $runs checks and none failed"
 }
 
 main() {
