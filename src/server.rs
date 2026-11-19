@@ -11,7 +11,9 @@ use tracing::error;
 
 use crate::cdc::feed::{FeedConfig, FeedHealth, FeedOutput, spawn_feed};
 use crate::kv_service::KvService;
+use crate::lease::{LeaseService, REAP_INTERVAL, spawn_reaper};
 use crate::pb::etcdserverpb::kv_server::KvServer;
+use crate::pb::etcdserverpb::lease_server::LeaseServer;
 use crate::pb::etcdserverpb::watch_server::WatchServer;
 use crate::store::Store;
 use crate::watch_hub::WatchHub;
@@ -55,8 +57,10 @@ pub async fn serve_listener(
         feed_health,
     };
     let mut pump = tokio::spawn(pump_feed(feed, state.hub.clone()));
+    let reaper = spawn_reaper(state.store.clone(), REAP_INTERVAL);
     let incoming = TcpIncoming::from_listener(listener, true, None)?;
     let server = Server::builder()
+        .add_service(LeaseServer::new(LeaseService::new(state.store.clone())))
         .add_service(KvServer::new(KvService::new(state.store.clone())))
         .add_service(WatchServer::new(WatchService::new(
             state.store.clone(),
@@ -67,10 +71,12 @@ pub async fn serve_listener(
         served = server => served,
         _ = &mut pump => {
             error!("cdc feed closed; watches can no longer be served");
+            reaper.abort();
             return Err("cdc feed closed".into());
         }
     };
     pump.abort();
+    reaper.abort();
     served?;
     Ok(())
 }

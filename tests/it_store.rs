@@ -495,6 +495,111 @@ async fn put_with_ttl_writes_index() {
     assert!(!ttl_index_contains(&store, &k, unix_now() + 61).await);
 }
 
+fn ttl_put(value: &str, ttl_secs: i64) -> Write {
+    Write::Put {
+        value: value.as_bytes().to_vec(),
+        ttl_secs: Some(ttl_secs),
+    }
+}
+
+async fn ttl_index_entries(store: &Store, etcd_key: &[u8]) -> usize {
+    let now = store.client().current_timestamp().await.unwrap();
+    let mut snapshot = store
+        .client()
+        .snapshot(now, TransactionOptions::new_optimistic());
+    let (start, end) = ttl_range_until(u64::MAX);
+    snapshot
+        .scan_keys(start..end, u32::MAX)
+        .await
+        .unwrap()
+        .filter(|ttl_key| parse_ttl_key(ttl_key.as_ref()).map(|(_, k)| k) == Some(etcd_key))
+        .count()
+}
+
+#[tokio::test]
+async fn delete_removes_the_ttl_index_entry() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let k = key(&unique_prefix(), "leased");
+    applied(&store, &k, None, ttl_put("v", 3600)).await;
+    assert_eq!(ttl_index_entries(&store, &k).await, 1);
+
+    applied(&store, &k, None, Write::Delete).await;
+
+    assert_eq!(ttl_index_entries(&store, &k).await, 0);
+}
+
+#[tokio::test]
+async fn delete_range_removes_ttl_index_entries() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let prefix = unique_prefix();
+    let keys = [key(&prefix, "a"), key(&prefix, "b")];
+    for k in &keys {
+        applied(&store, k, None, ttl_put("v", 3600)).await;
+    }
+
+    let mut range_end = prefix.clone();
+    *range_end.last_mut().unwrap() += 1;
+    store.delete_range(&prefix, &range_end).await.unwrap();
+
+    for k in &keys {
+        assert_eq!(ttl_index_entries(&store, k).await, 0);
+    }
+}
+
+#[tokio::test]
+async fn reput_with_a_different_ttl_replaces_the_index_entry() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let k = key(&unique_prefix(), "leased");
+    applied(&store, &k, None, ttl_put("v1", 3600)).await;
+    applied(&store, &k, None, ttl_put("v2", 7200)).await;
+
+    assert_eq!(ttl_index_entries(&store, &k).await, 1);
+}
+
+#[tokio::test]
+async fn delete_if_expired_deletes_only_an_expired_matching_record() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let k = key(&unique_prefix(), "leased");
+    applied(&store, &k, None, ttl_put("v", 3600)).await;
+    let expiry = get(&store, &k).await.unwrap().lease as u64;
+
+    assert!(!store.delete_if_expired(&k, expiry + 1).await.unwrap());
+    assert!(get(&store, &k).await.is_some());
+    assert!(store.delete_if_expired(&k, expiry).await.unwrap());
+    assert!(get(&store, &k).await.is_none());
+    assert_eq!(ttl_index_entries(&store, &k).await, 0);
+}
+
+#[tokio::test]
+async fn delete_if_expired_drops_a_stale_index_entry_and_keeps_the_key() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let k = key(&unique_prefix(), "leased");
+    applied(&store, &k, None, ttl_put("v", 3600)).await;
+    let stale_expiry = get(&store, &k).await.unwrap().lease as u64;
+    applied(&store, &k, None, put("v2")).await;
+    let mut txn = store.client().begin_optimistic().await.unwrap();
+    txn.put(tikvd::keys::ttl_key(stale_expiry, &k), Vec::new())
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    assert_eq!(ttl_index_entries(&store, &k).await, 1);
+
+    assert!(!store.delete_if_expired(&k, stale_expiry).await.unwrap());
+
+    assert_eq!(ttl_index_entries(&store, &k).await, 0);
+    assert_eq!(get(&store, &k).await.unwrap().value, b"v2");
+}
+
 #[tokio::test]
 async fn now_is_a_fresh_timestamp() {
     let Some(store) = test_store().await else {

@@ -8,7 +8,7 @@ use tikv_client::{
     TransactionOptions,
 };
 
-use crate::keys::{data_key, data_range, etcd_key, ttl_key};
+use crate::keys::{data_key, data_range, etcd_key, ttl_key, ttl_range_until};
 use crate::record::Record;
 
 const SCAN_PAGE: usize = 1024;
@@ -203,6 +203,30 @@ impl Store {
         }
     }
 
+    pub async fn expired_ttl_keys(
+        &self,
+        now_unix_secs: u64,
+        limit: u32,
+    ) -> Result<Vec<Vec<u8>>, StoreError> {
+        let read_at = self.client.current_timestamp().await?;
+        let mut snapshot = self.client.snapshot(read_at, read_options());
+        let (start, end) = ttl_range_until(now_unix_secs);
+        let keys = snapshot.scan_keys(start..end, limit).await?;
+        Ok(keys.map(Vec::from).collect())
+    }
+
+    pub async fn delete_if_expired(
+        &self,
+        key: &[u8],
+        expiry_unix_secs: u64,
+    ) -> Result<bool, StoreError> {
+        loop {
+            if let Some(deleted) = self.try_delete_if_expired(key, expiry_unix_secs).await? {
+                return Ok(deleted);
+            }
+        }
+    }
+
     pub async fn compact(&self, revision: i64) -> Result<(), StoreError> {
         if revision <= 0 {
             return Err(StoreError::Compacted);
@@ -268,6 +292,24 @@ impl Store {
             revision,
             prev: current.map(|current| current.key_value(key)),
         }))
+    }
+
+    async fn try_delete_if_expired(
+        &self,
+        key: &[u8],
+        expiry_unix_secs: u64,
+    ) -> Result<Option<bool>, StoreError> {
+        let mut txn = self.begin_write().await?;
+        let current = read_current(&mut txn, key).await?;
+        let expired = current
+            .as_ref()
+            .is_some_and(|current| current.record.lease_expiry == expiry_unix_secs);
+        if expired {
+            stage_delete(&mut txn, key, current.as_ref().map(|c| &c.record)).await?;
+        } else {
+            txn.delete(ttl_key(expiry_unix_secs, key)).await?;
+        }
+        Ok(commit_unless_conflicted(&mut txn).await?.map(|_| expired))
     }
 
     async fn try_delete_range(

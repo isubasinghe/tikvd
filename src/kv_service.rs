@@ -63,7 +63,7 @@ impl KvService {
         reject_unsupported_put_options(request)?;
         let write = Write::Put {
             value: request.value.clone(),
-            ttl_secs: None,
+            ttl_secs: ttl_of(request.lease)?,
         };
         let outcome = self
             .store
@@ -117,9 +117,11 @@ impl KvService {
     async fn txn_response(&self, request: &TxnRequest) -> Result<TxnResponse, Status> {
         let txn = parse_txn(request)?;
         let write = match &txn.write {
-            TxnWrite::Put { value, .. } => Write::Put {
+            TxnWrite::Put {
+                value, ttl_secs, ..
+            } => Write::Put {
                 value: value.clone(),
-                ttl_secs: None,
+                ttl_secs: *ttl_secs,
             },
             TxnWrite::Delete { .. } => Write::Delete,
         };
@@ -210,8 +212,14 @@ impl Kv for KvService {
 }
 
 enum TxnWrite {
-    Put { value: Vec<u8>, prev_kv: bool },
-    Delete { prev_kv: bool },
+    Put {
+        value: Vec<u8>,
+        ttl_secs: Option<i64>,
+        prev_kv: bool,
+    },
+    Delete {
+        prev_kv: bool,
+    },
 }
 
 struct ParsedTxn {
@@ -244,6 +252,7 @@ fn parse_txn(request: &TxnRequest) -> Result<ParsedTxn, Status> {
             }
             TxnWrite::Put {
                 value: put.value.clone(),
+                ttl_secs: ttl_of(put.lease)?,
                 prev_kv: put.prev_kv,
             }
         }
@@ -370,13 +379,20 @@ fn reject_unsupported_range_options(request: &RangeRequest) -> Result<(), Status
 }
 
 fn reject_unsupported_put_options(request: &PutRequest) -> Result<(), Status> {
-    if request.lease != 0 {
-        return Err(unsupported("put with a lease"));
-    }
     if request.ignore_value || request.ignore_lease {
         return Err(unsupported("put with ignore_value or ignore_lease"));
     }
     Ok(())
+}
+
+fn ttl_of(lease: i64) -> Result<Option<i64>, Status> {
+    match lease {
+        0 => Ok(None),
+        ttl if ttl > 0 => Ok(Some(ttl)),
+        _ => Err(Status::invalid_argument(
+            "etcdserver: lease id must not be negative",
+        )),
+    }
 }
 
 fn require_key(key: &[u8]) -> Result<(), Status> {
@@ -503,6 +519,50 @@ mod tests {
             limit: 2,
             ..plain_range()
         });
+    }
+
+    fn txn_with_put(put: PutRequest) -> TxnRequest {
+        let mut txn = txn_with_else(plain_range());
+        txn.success[0].request = Some(request_op::Request::RequestPut(PutRequest {
+            key: KEY.to_vec(),
+            ..put
+        }));
+        txn
+    }
+
+    #[test]
+    fn txn_put_with_a_lease_carries_the_ttl() {
+        let txn = parse_txn(&txn_with_put(PutRequest {
+            lease: 60,
+            ..Default::default()
+        }))
+        .expect("accepted");
+        let TxnWrite::Put { ttl_secs, .. } = txn.write else {
+            panic!("expected a put");
+        };
+        assert_eq!(ttl_secs, Some(60));
+    }
+
+    #[test]
+    fn txn_put_with_ignore_lease_is_unimplemented() {
+        let error = parse_txn(&txn_with_put(PutRequest {
+            ignore_lease: true,
+            ..Default::default()
+        }))
+        .err()
+        .expect("rejected");
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
+    }
+
+    #[test]
+    fn txn_put_with_a_negative_lease_is_invalid() {
+        let error = parse_txn(&txn_with_put(PutRequest {
+            lease: -1,
+            ..Default::default()
+        }))
+        .err()
+        .expect("rejected");
+        assert_eq!(error.code(), tonic::Code::InvalidArgument);
     }
 
     #[test]

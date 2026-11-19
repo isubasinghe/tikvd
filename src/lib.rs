@@ -1,6 +1,7 @@
 pub mod cdc;
 pub mod keys;
 pub mod kv_service;
+pub mod lease;
 pub mod pb;
 pub mod record;
 pub mod server;

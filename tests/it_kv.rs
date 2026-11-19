@@ -58,13 +58,17 @@ async fn put_and_delete_honour_prev_kv() {
 }
 
 #[tokio::test]
-async fn put_with_lease_is_unimplemented() {
+async fn put_with_ignore_lease_is_unimplemented() {
     let Some((mut client, _)) = start_tikvd().await else {
         return;
     };
     let key = format!("{}a", unique_prefix("it-kv"));
     let error = client
-        .put(key.as_str(), "v", Some(PutOptions::new().with_lease(7)))
+        .put(
+            key.as_str(),
+            "v",
+            Some(PutOptions::new().with_ignore_lease()),
+        )
         .await
         .unwrap_err();
     assert_eq!(status_code(&error), Code::Unimplemented);
