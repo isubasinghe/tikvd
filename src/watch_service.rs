@@ -353,10 +353,9 @@ fn compacted_response(watch_id: i64, revision: i64, hub: &WatchHub) -> WatchResp
 }
 
 fn to_proto_event(event: ChangeEvent, prev_kv: bool) -> mvccpb::Event {
-    let created_here = event.previous.is_none();
     let (kind, kv) = match event.current {
         Some(current) => {
-            let create_revision = if created_here {
+            let create_revision = if current.version == 1 {
                 event.revision
             } else {
                 current.created as i64
@@ -438,6 +437,40 @@ fn stream_progress(reported: impl Iterator<Item = i64>, watermark: i64) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record(version: i64, created: u64) -> Record {
+        Record {
+            version,
+            created,
+            lease_expiry: 0,
+            value: b"v".to_vec(),
+        }
+    }
+
+    #[test]
+    fn an_update_without_a_previous_value_is_not_reported_as_a_create() {
+        let event = ChangeEvent {
+            key: b"a".to_vec(),
+            revision: 50,
+            current: Some(record(2, 10)),
+            previous: None,
+        };
+        let kv = to_proto_event(event, false).kv.unwrap();
+        assert_ne!(kv.create_revision, kv.mod_revision);
+        assert_eq!(kv.create_revision, 10);
+    }
+
+    #[test]
+    fn a_first_version_is_reported_as_a_create_whatever_its_previous_value() {
+        let event = ChangeEvent {
+            key: b"a".to_vec(),
+            revision: 50,
+            current: Some(record(1, 10)),
+            previous: Some(record(3, 5)),
+        };
+        let kv = to_proto_event(event, false).kv.unwrap();
+        assert_eq!(kv.create_revision, kv.mod_revision);
+    }
 
     #[test]
     fn progress_is_never_below_the_watch_start() {
