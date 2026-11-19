@@ -4,7 +4,7 @@ use std::fmt;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use tikv_client::{
-    CheckLevel, Key, Snapshot, Timestamp, TimestampExt, Transaction, TransactionClient,
+    CheckLevel, Config, Key, Snapshot, Timestamp, TimestampExt, Transaction, TransactionClient,
     TransactionOptions,
 };
 
@@ -12,6 +12,7 @@ use crate::keys::{data_key, data_range, etcd_key, ttl_key, ttl_range_until};
 use crate::record::Record;
 
 const SCAN_PAGE: usize = 1024;
+const MAX_TIKV_RESPONSE_BYTES: usize = i32::MAX as usize;
 const COMPACT_KEY: &[u8] = b"m/compact";
 
 #[derive(Debug, Clone, PartialEq)]
@@ -126,7 +127,8 @@ pub struct Store {
 
 impl Store {
     pub async fn connect(pd_endpoints: Vec<String>) -> Result<Store, StoreError> {
-        let client = TransactionClient::new(pd_endpoints).await?;
+        let config = Config::default().with_grpc_max_decoding_message_size(MAX_TIKV_RESPONSE_BYTES);
+        let client = TransactionClient::new_with_config(pd_endpoints, config).await?;
         Ok(Store { client })
     }
 

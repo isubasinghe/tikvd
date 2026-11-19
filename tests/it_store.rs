@@ -369,6 +369,33 @@ async fn keys_only() {
 }
 
 #[tokio::test]
+async fn range_larger_than_a_default_grpc_message() {
+    let Some(store) = test_store().await else {
+        return;
+    };
+    let prefix = unique_prefix();
+    let value = vec![b'x'; 1024 * 1024];
+    let names = ["a", "b", "c", "d", "e", "f"];
+    for name in names {
+        let write = Write::Put {
+            value: value.clone(),
+            ttl_secs: None,
+        };
+        applied(&store, &key(&prefix, name), None, write).await;
+    }
+
+    let result = store
+        .range(RangeQuery {
+            limit: 10_000,
+            ..prefix_query(&prefix)
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.kvs.len(), names.len());
+    assert!(result.kvs.iter().all(|kv| kv.value == value));
+}
+
+#[tokio::test]
 async fn count_only() {
     let Some(store) = test_store().await else {
         return;
