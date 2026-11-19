@@ -74,6 +74,7 @@ struct Registration {
     request_id: u64,
     stream: u64,
     initialized: bool,
+    // ponytail: bounded only by how many commits one region's incremental scan overlaps; cap it and re-register past the cap if scans get long
     early_commits: Vec<Row>,
     scanned_commits: HashSet<(Vec<u8>, u64)>,
 }
@@ -473,6 +474,7 @@ impl Session {
             .iter()
             .map(|(_, checkpoint)| *checkpoint)
             .min();
+        // ponytail: a fresh session skips this check, safe only because the hub vouches from the first watermark; check the floor too if the hub ever vouches earlier
         !self.tracked.is_empty() && lowest.is_some_and(|lowest| lowest < compact_revision)
     }
 

@@ -34,6 +34,7 @@ pub fn spawn_reaper(store: Store, interval: Duration) -> tokio::task::JoinHandle
 
 async fn reap_expired(store: &Store) -> Result<(), StoreError> {
     let index_keys = store.expired_ttl_keys(REAP_BATCH).await?;
+    // ponytail: a corrupt or unparseable ttl entry stays at the index head and is retried every tick, so REAP_BATCH of them stall reaping; delete such entries here if any appear
     for index_key in index_keys {
         let Some((expiry, key)) = parse_ttl_key(&index_key) else {
             warn!(?index_key, "unparseable ttl index key");

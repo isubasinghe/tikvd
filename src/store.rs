@@ -240,6 +240,7 @@ impl Store {
                 break raised;
             }
         };
+        // ponytail: an error from gc alone is returned although the compaction took effect; report success and retry gc in the background if clients mind
         if previous > 0 {
             // ponytail: gc resolves locks across the whole keyspace before moving the safepoint; scope it to k/ if that gets slow
             self.client
@@ -340,6 +341,7 @@ impl Store {
         Ok(commit_unless_conflicted(&mut txn).await?.map(|_| expired))
     }
 
+    // ponytail: one in-memory transaction that can miss a key created in the range while it runs; page it and recheck the range if range deletes grow or must be exact
     async fn try_delete_range(
         &self,
         key: &[u8],

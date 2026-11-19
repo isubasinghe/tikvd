@@ -35,6 +35,7 @@ struct ResolvedBy {
 
 #[derive(Default)]
 pub struct Assembler {
+    // ponytail: held prewrites are not counted against the sorter's memory limit; count them there if large uncommitted writes pile up
     prewrites: HashMap<(Vec<u8>, u64), HeldPrewrite>,
 }
 

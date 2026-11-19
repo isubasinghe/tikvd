@@ -122,6 +122,17 @@ but not observed.
    it holds. Other tags, including v8.5.1 to v8.5.3, v8.5.7 and
    everything before v7.5.8, were not tested.
    From source: `BatchGet` accepts the flag too and `Scan` does not.
+7. From source: TiKV does not publish a resolved timestamp for a region
+   whose range has shrunk (by a split or merge) before it sends that
+   region's error to its CDC subscribers. The feed's safety relies on
+   this, because it applies a resolved timestamp to the whole range the
+   registration was made for.
+8. Observed by the final review's probe on v8.5.6: an abandoned prewrite
+   lock on an `l/` key in the same region as `k/` keys did not hold back
+   the resolved timestamp seen by a subscription bounded to `k/`. This is
+   why lock cleanup scoped to the `k/` range is enough. On a TiKV version
+   that tracked locks region-wide, such a lock would instead stall every
+   instance's watermark until something else resolved it.
 6. `Transaction::commit` in `tikv-client` 0.4.0 returns `Some` commit
    timestamp for one-phase and two-phase commits. From source: it does not
    set `need_commit_ts`, does not expose CDC, and keeps its protobuf types
@@ -225,7 +236,8 @@ Supported requests, matching what kube-apiserver sends:
   kube-apiserver's compactor), then one `Put` or `DeleteRange` on that key,
   else an optional `Range` on that key. The nested `Put` response carries
   its own header with the new revision.
-- Bare `Put` and single-key or range `DeleteRange`.
+- Bare `Put` and single-key or range `DeleteRange` (a range
+  `DeleteRange` with `prev_kv` returns `UNIMPLEMENTED`).
 - `Compact`.
 
 A write runs as an optimistic two-phase TiKV transaction: read the key with
@@ -249,8 +261,9 @@ Each `tikvd` instance runs one CDC consumer covering the `k/` range:
    commit timestamp) with the same key and start timestamp arrives, and
    dropped on `ROLLBACK`. `INITIALIZED` marks the end of a region's
    incremental scan. Request old values so `prev_kv` and delete events can
-   be populated. An assembled event with no old value is a create; for a
-   two-phase write the old value is the one from the `PREWRITE` row.
+   be populated; for a two-phase write the old value is the one from the
+   `PREWRITE` row. A put event is a create when its record's `version` is
+   1, the same rule the KV reads use.
 3. Hold committed events in a sorter ordered by commit timestamp,
    deduplicated by key and commit timestamp, because re-registering a
    region replays events above its last resolved timestamp.
@@ -263,11 +276,12 @@ Each `tikvd` instance runs one CDC consumer covering the `k/` range:
    range's last resolved timestamp. The watermark does not advance past a
    range that has no live registration.
 6. When a region's resolved timestamp falls behind by more than a
-   threshold, scan that region for locks older than the threshold and
-   resolve them with the client's lock-cleanup calls. A put with a lease
-   spans two regions and so commits in two phases; a `tikvd` that crashes
+   threshold, scan that region's part of the `k/` range for locks older
+   than the threshold and resolve them with the client's lock-cleanup
+   calls. Every write commits in two phases, so a `tikvd` that crashes
    mid-commit leaves a lock that would otherwise hold the watermark back
-   for every instance.
+   for every instance. Scoping the scan to `k/` is enough because of
+   fact 8.
 
 A stalled watermark is safe: watches and progress notifications pause, and
 nothing wrong is delivered. An instance whose watermark has been stalled
@@ -292,8 +306,10 @@ deployment guidance is to set `cdc.min-ts-interval` to about 200ms.
 
 kube-apiserver uses leases only to give keys a TTL. `LeaseGrant` returns an
 ID that encodes the TTL and stores nothing. A put with that lease computes
-the expiry and writes it in the record and the TTL index. Every instance
-runs a reaper that scans the index up to the current time and deletes
+the expiry from PD time, as its transaction's start timestamp rounded up
+to a whole second plus the TTL, and writes it in the record and the TTL
+index. Every instance runs a reaper that scans the index up to the
+current PD time, rounded down to a whole second, and deletes
 expired keys through the normal write path, conditional on the record still
 carrying that expiry. Racing reapers conflict harmlessly, and watchers see
 ordinary delete events. `LeaseRevoke` and `LeaseKeepAlive` are not needed
@@ -306,8 +322,8 @@ keeps its own compaction revision in `m/compact`.
 
 - `Compact(R)` rejects a non-positive R as compacted and an R above the
   current timestamp as a future revision. Otherwise it reads the previous
-  compaction revision P, writes R to `m/compact` if R is higher, and then
-  advances TiKV's GC safepoint to P, not to R.
+  compaction revision P, rejects an R at or below P as compacted, writes
+  R to `m/compact`, and then advances TiKV's GC safepoint to P, not to R.
 - GC therefore runs one compaction behind. A read that passed the check
   just before a compaction has a whole compaction interval (five minutes
   under kube-apiserver) before its data can be collected.
@@ -346,6 +362,27 @@ repo this way.)
 - Range reads cost a scan plus a batch get.
 - `count_only` scans the whole range.
 - Requires a TiKV version whose `Get`/`BatchGet` honour `need_commit_ts`.
+- TTL is counted from each put by PD time, in whole seconds, rounded up,
+  so a key lives at least its TTL; the rounding and the reaper's
+  one-second interval can add about two seconds.
+- `KeyValue.lease` is the key's expiry time in unix seconds, not a lease
+  id. A lease id is its TTL in seconds, and a put accepts any positive id
+  as a TTL. A TTL whose expiry could not be represented in an `i64` is
+  rejected.
+- `prev_kv.mod_revision` in watch events is always 0.
+- A `Range` at an explicit revision reports that revision in its header,
+  not the current one.
+- Connections from `tikvd` to PD and TiKV are plaintext.
+- A single read that is still running when two later compactions commit
+  can read collected data, because GC runs one compaction behind. A CDC
+  incremental scan running in the same window can too.
+- `Compact` returns an error when only its gc step failed, although the
+  compaction took effect.
+- A range delete is one in-memory transaction and can miss a key created
+  in the range while it runs.
+- The watch window is bounded by 100,000 events and by 256 MiB; each
+  watcher's queue by 1024 batches and by 64 MiB. A watcher that passes
+  either queue bound is cancelled.
 
 ## Order of work
 
