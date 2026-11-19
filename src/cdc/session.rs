@@ -498,6 +498,7 @@ impl Session {
             region_id,
             request_id,
             checkpoint_ts = request.checkpoint_ts,
+            store_address,
             "registering cdc region"
         );
         region.registration = Some(Registration {

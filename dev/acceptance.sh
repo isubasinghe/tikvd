@@ -8,7 +8,23 @@ K3S_IMAGE=rancher/k3s:v1.36.2-k3s1
 ARGO_VERSION=v4.1.6
 ARGO_RELEASE_URL=https://github.com/argoproj/argo-workflows/releases/download/$ARGO_VERSION/quick-start-minimal.yaml
 HELLO_WORLD_URL=https://raw.githubusercontent.com/argoproj/argo-workflows/$ARGO_VERSION/examples/hello-world.yaml
-PD_ADDRESS=127.0.0.1:2379
+STORES=${STORES:-1}
+case $STORES in
+1)
+    COMPOSE_FILE=$REPO_ROOT/dev/docker-compose.yml
+    PD_ADDRESS=127.0.0.1:2379
+    PD_CONTAINER=tikvd-dev-pd-1
+    ;;
+3)
+    COMPOSE_FILE=$REPO_ROOT/dev/docker-compose.3store.yml
+    PD_ADDRESS=127.0.0.1:12379
+    PD_CONTAINER=tikvd-3store-pd-1
+    ;;
+*)
+    echo "acceptance: STORES must be 1 or 3, not $STORES" >&2
+    exit 2
+    ;;
+esac
 TIKVD_PORTS=(2479 2480)
 TIKVD_LOG_FILTER=info,tikvd=debug
 NODE_CONTAINER=k3d-$CLUSTER_NAME-server-0
@@ -61,18 +77,25 @@ cleanup() {
         stop_tikvd "$port" || say "cleanup: could not stop tikvd on :$port"
     done
     remove_own_network || say "cleanup: could not remove network $CLUSTER_NETWORK"
+    if [[ $STORES == 3 ]]; then
+        docker compose -f "$COMPOSE_FILE" down -v >/dev/null 2>&1 || say "cleanup: could not remove the three-store cluster"
+    fi
     exit "$status"
 }
 
-pd_reports_store_up() {
-    curl -fsS "http://$PD_ADDRESS/pd/api/v1/stores" | jq -e '.stores[0].store.state_name == "Up"'
+pd() { curl -fsS "http://$PD_ADDRESS/pd/api/v1/$1"; }
+
+pd_ctl() { docker exec "$PD_CONTAINER" /pd-ctl -u "http://$PD_ADDRESS" "$@"; }
+
+pd_reports_stores_up() {
+    pd stores | jq -e --argjson stores "$STORES" '[.stores[] | select(.store.state_name == "Up")] | length == $stores'
 }
 
 recreate_tikv() {
-    say "recreating PD and TiKV from empty"
-    docker compose -f "$REPO_ROOT/dev/docker-compose.yml" down >/dev/null 2>&1
-    docker compose -f "$REPO_ROOT/dev/docker-compose.yml" up -d >/dev/null 2>&1
-    wait_until 120 "TiKV store Up in PD" pd_reports_store_up
+    say "recreating PD and $STORES TiKV store(s) from empty ($(basename "$COMPOSE_FILE"))"
+    docker compose -f "$COMPOSE_FILE" down -v >/dev/null 2>&1
+    docker compose -f "$COMPOSE_FILE" up -d >/dev/null 2>&1
+    wait_until 120 "$STORES TiKV store(s) Up in PD" pd_reports_stores_up
 }
 
 build_tikvd() {
@@ -227,7 +250,7 @@ run_workflow() {
 }
 
 region_count() {
-    curl -fsS "http://$PD_ADDRESS/pd/api/v1/regions" | jq '.count'
+    pd regions | jq '.count'
 }
 
 region_count_above() { (($(region_count) > $1)); }
@@ -244,8 +267,12 @@ for i in range(0, len(raw) + 1, 8):
 print(out.hex().upper())' "$1"
 }
 
+region_holding() {
+    pd "region/key/$(memcomparable_hex "$1")?format=hex"
+}
+
 region_id_holding() {
-    curl -fsS "http://$PD_ADDRESS/pd/api/v1/region/key/$(memcomparable_hex "$1")?format=hex" | jq '.id'
+    region_holding "$1" | jq '.id'
 }
 
 log_lines() { wc -l <"$(tikvd_log "$1")"; }
@@ -263,7 +290,7 @@ split_registry_region() {
         lines_before[$port]=$(log_lines "$port")
     done
     say "splitting region $region_id at $split_key ($before regions)"
-    docker exec tikvd-dev-pd-1 /pd-ctl -u "http://$PD_ADDRESS" operator add split-region "$region_id" \
+    pd_ctl operator add split-region "$region_id" \
         --policy=usekey --keys="$(memcomparable_hex "$split_key")" >&2
     wait_until 60 "PD to report the split" region_count_above "$before"
     left_id=$(region_id_holding "$left_key")
@@ -295,6 +322,106 @@ run_disruption_checks() {
     say "submitted $workflow, splitting the k/ region mid-workflow"
     split_registry_region
     await_workflow "$workflow"
+}
+
+store_address() {
+    pd "store/$1" | jq -r '.store.address'
+}
+
+region_leader_store() {
+    pd "region/id/$1" | jq '.leader.store_id'
+}
+
+region_leader_is() { (($(region_leader_store "$1") == $2)); }
+
+registered_on_since() {
+    log_since "$1" "$2" | grep -E "registering cdc region region_id=$3 .*store_address=\"$4\"" >/dev/null
+}
+
+show_feed_log_since() {
+    log_since "$1" "$2" | grep -E "cdc region error|cdc stream closed|registering cdc region|resetting the feed" |
+        cut -c1-240 | sed "s/^/acceptance: :$1 /" >&2
+}
+
+leader_region_key=k/registry/
+
+transfer_registry_leader() {
+    local region region_id from to address port
+    local -A lines_before
+    region=$(region_holding "$leader_region_key")
+    region_id=$(jq '.id' <<<"$region")
+    from=$(jq '.leader.store_id' <<<"$region")
+    to=$(jq --argjson from "$from" '[.peers[] | select(.store_id != $from) | .store_id][0]' <<<"$region")
+    [[ $to != null ]] || fail "region $region_id has no peer outside store $from to transfer its leader to"
+    address=$(store_address "$to")
+    for port in "${TIKVD_PORTS[@]}"; do
+        lines_before[$port]=$(log_lines "$port")
+    done
+    say "transferring the leader of region $region_id (holds $leader_region_key) from store $from to store $to ($address)"
+    pd_ctl operator add transfer-leader "$region_id" "$to" >&2
+    wait_until 60 "PD to report store $to leading region $region_id" region_leader_is "$region_id" "$to"
+    say "PD reports region $region_id led by store $(region_leader_store "$region_id")"
+    for port in "${TIKVD_PORTS[@]}"; do
+        wait_until 60 "tikvd on :$port to register region $region_id on store $to ($address)" \
+            registered_on_since "$port" "${lines_before[$port]}" "$region_id" "$address"
+        show_feed_log_since "$port" "${lines_before[$port]}"
+    done
+}
+
+store_container() {
+    local address=$1 service
+    case ${address##*:} in
+    12160) service=tikv1 ;;
+    12161) service=tikv2 ;;
+    12162) service=tikv3 ;;
+    *) fail "store address $address is not one of the three-store cluster's" ;;
+    esac
+    echo "tikvd-3store-$service-1"
+}
+
+leaders_on_store() {
+    pd regions | jq --argjson store "$1" '[.regions[] | select(.leader.store_id == $store)] | length'
+}
+
+no_leaders_on_store() { (($(leaders_on_store "$1") == 0)); }
+
+store_state_is() { [[ $(pd "store/$1" | jq -r '.store.state_name') == "$2" ]]; }
+
+stop_registry_leader_store() {
+    local region_id store address container port
+    local -A lines_before
+    region_id=$(region_id_holding "$leader_region_key")
+    store=$(region_leader_store "$region_id")
+    address=$(store_address "$store")
+    container=$(store_container "$address")
+    for port in "${TIKVD_PORTS[@]}"; do
+        lines_before[$port]=$(log_lines "$port")
+    done
+    say "stopping store $store ($address, container $container), which leads region $region_id; it leads $(leaders_on_store "$store") regions"
+    docker stop "$container" >/dev/null
+    wait_until 120 "PD to move every leader off store $store" no_leaders_on_store "$store"
+    say "PD reports $(leaders_on_store "$store") leaders on store $store; region $region_id is led by store $(region_leader_store "$region_id")"
+    for port in "${TIKVD_PORTS[@]}"; do
+        wait_until 60 "tikvd on :$port to register region $region_id away from store $store" \
+            registered_on_since "$port" "${lines_before[$port]}" "$region_id" "$(store_address "$(region_leader_store "$region_id")")"
+        show_feed_log_since "$port" "${lines_before[$port]}"
+    done
+    run_workflow
+    report_feed_resets
+    docker start "$container" >/dev/null
+    wait_until 120 "store $store Up again in PD" store_state_is "$store" Up
+    say "store $store is Up again"
+}
+
+run_store_disruption_checks() {
+    local workflow
+    workflow=$(submit_workflow)
+    say "submitted $workflow, transferring a region leader mid-workflow"
+    transfer_registry_leader
+    await_workflow "$workflow"
+    report_feed_resets
+
+    stop_registry_leader_store
 }
 
 report_unimplemented() {
@@ -363,6 +490,9 @@ main() {
     run_workflow
     if [[ $DISRUPT == 1 ]]; then
         run_disruption_checks
+        if [[ $STORES == 3 ]]; then
+            run_store_disruption_checks
+        fi
     fi
     if ((SOAK_SECS > 0)); then
         say "soaking for ${SOAK_SECS}s"

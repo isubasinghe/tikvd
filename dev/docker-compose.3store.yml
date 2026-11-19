@@ -1,0 +1,54 @@
+name: tikvd-3store
+
+x-tikv: &tikv
+  image: pingcap/tikv:v8.5.6
+  network_mode: host
+  depends_on:
+    - pd
+  configs:
+    - source: tikv
+      target: /tikv.toml
+
+services:
+  pd:
+    image: pingcap/pd:v8.5.6
+    network_mode: host
+    command:
+      - --name=pd
+      - --data-dir=/data/pd
+      - --client-urls=http://127.0.0.1:12379
+      - --peer-urls=http://127.0.0.1:12380
+      - --initial-cluster=pd=http://127.0.0.1:12380
+
+  tikv1:
+    <<: *tikv
+    command:
+      - --addr=127.0.0.1:12160
+      - --status-addr=127.0.0.1:12180
+      - --pd=127.0.0.1:12379
+      - --data-dir=/data/tikv
+      - --config=/tikv.toml
+
+  tikv2:
+    <<: *tikv
+    command:
+      - --addr=127.0.0.1:12161
+      - --status-addr=127.0.0.1:12181
+      - --pd=127.0.0.1:12379
+      - --data-dir=/data/tikv
+      - --config=/tikv.toml
+
+  tikv3:
+    <<: *tikv
+    command:
+      - --addr=127.0.0.1:12162
+      - --status-addr=127.0.0.1:12182
+      - --pd=127.0.0.1:12379
+      - --data-dir=/data/tikv
+      - --config=/tikv.toml
+
+configs:
+  tikv:
+    content: |
+      [cdc]
+      min-ts-interval = "200ms"
