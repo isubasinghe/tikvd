@@ -19,7 +19,6 @@ use crate::store::Store;
 
 const OUTPUT_CAPACITY: usize = 64;
 const INCOMING_CAPACITY: usize = 1024;
-const TICK: Duration = Duration::from_millis(100);
 const LOCK_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
@@ -159,7 +158,6 @@ struct Runner {
     streams: HashMap<u64, StreamHandle>,
     cleanups_running: usize,
     clock_pending: bool,
-    last_clock: Instant,
 }
 
 impl Runner {
@@ -174,7 +172,6 @@ impl Runner {
             streams: HashMap::new(),
             cleanups_running: 0,
             clock_pending: false,
-            last_clock: Instant::now(),
         }
     }
 
@@ -182,15 +179,15 @@ impl Runner {
         if let Err(ended) = self.execute(first_actions).await {
             return ended;
         }
-        let mut tick = tokio::time::interval(TICK);
-        tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut lock_check = tokio::time::interval(LOCK_CHECK_INTERVAL);
+        lock_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             let actions = tokio::select! {
                 _ = self.out.closed() => return Ended::Closed,
                 Some(incoming) = self.incoming_rx.recv() => self.on_incoming(&mut session, incoming),
-                _ = tick.tick() => {
+                _ = lock_check.tick() => {
                     self.request_clock();
-                    session.on_tick()
+                    Vec::new()
                 }
             };
             if let Err(ended) = self.execute(actions).await {
@@ -285,14 +282,10 @@ impl Runner {
     }
 
     fn request_clock(&mut self) {
-        if self.clock_pending
-            || self.cleanups_running > 0
-            || self.last_clock.elapsed() < LOCK_CHECK_INTERVAL
-        {
+        if self.clock_pending || self.cleanups_running > 0 {
             return;
         }
         self.clock_pending = true;
-        self.last_clock = Instant::now();
         let store = self.store.clone();
         let incoming = self.incoming.clone();
         tokio::spawn(async move {

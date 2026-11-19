@@ -60,7 +60,8 @@ plus a SQL layer. Rejected for the same reason as A.
 ## Facts this design rests on
 
 Observed on 2026-11-19 against one PD and one TiKV in Docker
-(`dev/docker-compose.yml`, `cdc.min-ts-interval = "200ms"`), on the pinned
+(`dev/docker-compose.yml`, then with `cdc.min-ts-interval = "200ms"`; fact 9
+at `"10ms"`), on the pinned
 v8.5.6 and on nightly (9.0.0-beta.2), with unpatched `tikv-client` 0.4.0
 writing and gRPC bindings generated from `pingcap/kvproto` master reading.
 Items marked "from source" were read in `tikv/tikv` and `tikv/client-rust`
@@ -138,6 +139,13 @@ but not observed.
    why lock cleanup scoped to the `k/` range is enough. On a TiKV version
    that tracked locks region-wide, such a lock would instead stall every
    instance's watermark until something else resolved it.
+9. Observed with `cdc.min-ts-interval = "10ms"` on the one-store dev
+   cluster: one writer putting a key every 10 ms through an in-process
+   `tikvd` that watches the prefix, 600 writes per run, two runs each, time
+   from the put's response to the watch event. With the feed releasing on a
+   100 ms tick the lag was 56 ms p50 and 106 to 107 ms p99. Releasing from
+   the CDC message that moves the watermark, it was 5.6 to 5.7 ms p50 and
+   11.3 ms p99, max 11.8 ms. No event was missing in either.
 
 ## Assumptions
 
@@ -270,7 +278,8 @@ Each `tikvd` instance runs one CDC consumer covering the `k/` range:
 4. Track the resolved timestamp per region. The watermark is the minimum
    across all regions covering the range. Release events at or below the
    watermark, in commit-timestamp order, to a bounded in-memory window and
-   to subscribed watchers.
+   to subscribed watchers, as soon as the CDC message (or region lookup)
+   that moves the watermark has been applied.
 5. On a region error (leader moved, split, merge, epoch change), look the
    range up again in PD and re-register the affected regions from that
    range's last resolved timestamp. The watermark does not advance past a
@@ -281,7 +290,7 @@ Each `tikvd` instance runs one CDC consumer covering the `k/` range:
    calls. Every write commits in two phases, so a `tikvd` that crashes
    mid-commit leaves a lock that would otherwise hold the watermark back
    for every instance. Scoping the scan to `k/` is enough because of
-   fact 8.
+   fact 8. The lag check runs once a second.
 
 A stalled watermark is safe: watches and progress notifications pause, and
 nothing wrong is delivered. An instance whose watermark has been stalled
@@ -301,8 +310,11 @@ A client watch with start revision R:
 
 Progress notifications and `WatchProgressRequest` report the watermark.
 
-Watch delivery lags commits by the resolved-timestamp interval. The
-deployment guidance is to set `cdc.min-ts-interval` to about 200ms.
+Watch delivery lags a commit by up to TiKV's resolved-timestamp interval
+plus the TSO and `check_leader` round trips TiKV makes to advance it;
+`tikvd` adds no wait of its own. The deployment guidance is to set
+`cdc.min-ts-interval` to 10ms (fact 9). TiKV and PD spend more CPU the
+lower it is.
 
 ### Leases
 
@@ -351,7 +363,10 @@ repo this way.)
 
 ## Known limits
 
-- Watch and progress lag by `cdc.min-ts-interval`.
+- Watch and progress lag by up to `cdc.min-ts-interval` plus TiKV's round
+  trips to advance it: 5.6 ms p50 and 11.3 ms p99 at 10ms on one store
+  (fact 9). A client that writes and then acts on its watch cache sooner
+  than that can see the state from before its write.
 - Each instance holds its own CDC subscription to every region in the
   range, so CDC load on TiKV grows with the number of instances.
 - `count` on a paged list rescans the range's keys on every page.
@@ -432,6 +447,43 @@ re-runs of failed tests on `tikvd`.
 - ControllerRevision should manage the lifecycle of a ControllerRevision:
   caused by `tikvd`; failed 1 of 2. The DaemonSet controller deleted the
   revision the test then tried to delete, 19 ms earlier.
+
+Re-run on 2026-11-19 after the feed began releasing from the CDC message
+that moves the watermark and `cdc.min-ts-interval` became 10ms (fact 9),
+same cluster shape and suite:
+
+- Full, `[Conformance]`, 28 min: 442 passed, 4 failed, 7133 skipped.
+  Gates: no `UNIMPLEMENTED`, no feed reset, cache consistency asserted
+  (418 checks, none failed).
+- AdmissionWebhook timeout, NoExecuteTaintManager, OrderedNamespaceDeletion
+  and ControllerRevision passed.
+- kube-controller-manager logged 1,140 `is not as new as written version`
+  errors against 2,158 before. The write each one had not yet seen was
+  44 ms old at p50 and 111 ms at p99 when logged (98 and 262 ms before),
+  measured from the write's commit timestamp, which trails wall clock.
+- Mean `etcd_request_duration_seconds` at the end of the run: create
+  27.8 ms, update 24.8, delete 16.7, get 1.5, list 3.7.
+
+All four failures are one race in kube-apiserver's CRD finalizer, each
+failing a CRD delete after 30 s. Re-run alone twice each: CRD
+creating/deleting failed 1 of 2, CRD listing 2 of 2, CustomResourcePublishOpenAPI
+same group and version but different kinds 2 of 2, same group but
+different versions 1 of 2.
+
+- The finalizer's first list of the custom resources creates their watch
+  cache and fails with "storage is (re)initializing"; this happens on the
+  Kine baseline too. It writes a failure condition and retries 11 to
+  238 ms later from its CRD lister. If the lister has not yet seen that write,
+  the retry's status update conflicts and the finalizer drops the key;
+  the write itself changed only the Terminating condition, which the
+  finalizer does not requeue on. The CRD is then deleted at the five-minute
+  resync.
+- Over the full run and the re-runs the finalizer hit this 14 times.
+  The 4 retries that wrote recovered; the 10 that did not are exactly
+  the 10 failed test runs. The losing retries came 13 to 238 ms after
+  the write, the winning ones 11 to 31 ms. Closing this race needs the lister to see a write within a few
+  milliseconds of its response, which a resolved-timestamp watermark at
+  10ms does not give.
 
 ## Order of work
 
