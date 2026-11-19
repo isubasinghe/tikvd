@@ -388,6 +388,51 @@ repo this way.)
 - A watch whose replay from the window would exceed the per-watcher
   bound is told to relist (cancelled as compacted).
 
+## Conformance
+
+Run on 2026-11-19 by `CONFORMANCE=focus|full dev/acceptance.sh`: k3s
+v1.36.2+k3s1 (one server, two agents) against two `tikvd` instances on
+one PD and one TiKV v8.5.6, Hydrophone v0.8.0, image
+`registry.k8s.io/conformance:v1.36.2`, 16 Ginkgo processes, `[Serial]`
+specs run alone at the end. The baseline (`CONFORMANCE_BASELINE=1`) is
+the same cluster shape on k3s's default datastore, Kine on SQLite.
+
+- Focus, `[sig-api-machinery].*[Conformance]`, 12 min: 96 passed, 3
+  failed, 7480 skipped.
+- Full, `[Conformance]`, 32 min: 439 passed, 7 failed, 7133 skipped.
+  Baseline full, 29 min: 446 passed, 0 failed, 7133 skipped.
+- Gates after each run: no `UNIMPLEMENTED`, no feed reset, cache
+  consistency asserted (190 checks focus, 486 full, none failed).
+
+Every failed test passed on the baseline, both alone and in its full
+run. Run counts below are over the focus run, the full run and the
+re-runs of failed tests on `tikvd`.
+
+- AdmissionWebhook should honor timeout: caused by `tikvd`, watch lag;
+  failed 4 of 4. The test deletes and recreates a webhook configuration
+  of the same name 12 ms apart, and kube-apiserver still applied the
+  deleted one.
+- CustomResourcePublishOpenAPI, works for multiple CRDs of different
+  groups (2 of 3), of same group and version but different kinds (3 of
+  4), of same group but different versions (1 of 3);
+  CustomResourceDefinition creating/deleting (1 of 3): caused by `tikvd`,
+  watch lag. The CRD finalizer's retry read its stale lister, got a
+  conflict and dropped the key; the CRD was removed at the finalizer's
+  five-minute resync, after the test's 30 s wait.
+- NoExecuteTaintManager removing taint cancels eviction: caused by
+  `tikvd`, watch lag; failed 2 of 2. The test reads the node at
+  `resourceVersion=0` from the watch cache 3 ms after confirming the
+  taint, finds no taint and skips the removal.
+- OrderedNamespaceDeletion namespace deletion should delete pod first:
+  caused by `tikvd`; failed 1 of 3, only under full-suite load. The
+  namespace controller first acted 2 min 18 s after the delete and
+  deleted the namespace 7 min after its last pod went. Mean namespace
+  queue wait was 330 s against 209 s on the baseline; mean write latency
+  seen by kube-apiserver was 14 to 22 ms against 1.5 to 2.5 ms.
+- ControllerRevision should manage the lifecycle of a ControllerRevision:
+  caused by `tikvd`; failed 1 of 2. The DaemonSet controller deleted the
+  revision the test then tried to delete, 19 ms earlier.
+
 ## Order of work
 
 0. **Spike, throwaway.** Against a local TiKV + PD in Docker, confirm the
