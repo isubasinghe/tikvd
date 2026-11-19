@@ -3,8 +3,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use tokio::net::TcpListener;
-use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
+use tonic::transport::server::TcpIncoming;
 
 use crate::kv_service::KvService;
 use crate::pb::etcdserverpb::kv_server::KvServer;
@@ -32,9 +32,10 @@ pub async fn serve_listener(
         return Err("tls is not supported yet".into());
     }
     let store = Store::connect(config.pd_endpoints).await?;
+    let incoming = TcpIncoming::from_listener(listener, true, None)?;
     Server::builder()
         .add_service(KvServer::new(KvService::new(store)))
-        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
+        .serve_with_incoming_shutdown(incoming, shutdown)
         .await?;
     Ok(())
 }

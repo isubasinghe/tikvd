@@ -1380,7 +1380,6 @@ dependencies = [
  "prost",
  "tikv-client",
  "tokio",
- "tokio-stream",
  "tonic",
  "tonic-build",
  "tracing",

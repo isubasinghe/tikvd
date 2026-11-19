@@ -291,11 +291,24 @@ fn parse_failure(failure: &[RequestOp], compared_key: &[u8]) -> Result<bool, Sta
             RequestOp {
                 request: Some(request_op::Request::RequestRange(range)),
             },
-        ] if range.key == compared_key && range.range_end.is_empty() => Ok(true),
+        ] if range.key == compared_key && range.range_end.is_empty() => {
+            reject_unsupported_else_range(range)?;
+            Ok(true)
+        }
         _ => Err(unsupported(
             "txn failure branch other than one range on the compared key",
         )),
     }
+}
+
+fn reject_unsupported_else_range(range: &RangeRequest) -> Result<(), Status> {
+    reject_unsupported_range_options(range)?;
+    if range.revision != 0 || range.count_only || range.keys_only || range.limit > 1 {
+        return Err(unsupported(
+            "txn failure range with revision, count_only, keys_only or a limit above 1",
+        ));
+    }
+    Ok(())
 }
 
 fn applied_op(write: &TxnWrite, revision: i64, prev: Option<store::KeyValue>) -> ResponseOp {
@@ -409,4 +422,98 @@ fn to_proto(kv: store::KeyValue) -> mvccpb::KeyValue {
 
 fn show(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pb::etcdserverpb::Compare;
+
+    const KEY: &[u8] = b"k";
+
+    fn txn_with_else(range: RangeRequest) -> TxnRequest {
+        TxnRequest {
+            compare: vec![Compare {
+                result: compare::CompareResult::Equal as i32,
+                target: compare::CompareTarget::Mod as i32,
+                key: KEY.to_vec(),
+                target_union: Some(compare::TargetUnion::ModRevision(0)),
+                range_end: Vec::new(),
+            }],
+            success: vec![RequestOp {
+                request: Some(request_op::Request::RequestPut(PutRequest {
+                    key: KEY.to_vec(),
+                    value: b"v".to_vec(),
+                    ..Default::default()
+                })),
+            }],
+            failure: vec![RequestOp {
+                request: Some(request_op::Request::RequestRange(range)),
+            }],
+        }
+    }
+
+    fn plain_range() -> RangeRequest {
+        RangeRequest {
+            key: KEY.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn assert_unimplemented(range: RangeRequest) {
+        let error = parse_txn(&txn_with_else(range)).err().expect("rejected");
+        assert_eq!(error.code(), tonic::Code::Unimplemented);
+    }
+
+    #[test]
+    fn else_range_with_revision_is_unimplemented() {
+        assert_unimplemented(RangeRequest {
+            revision: 5,
+            ..plain_range()
+        });
+    }
+
+    #[test]
+    fn else_range_with_count_only_is_unimplemented() {
+        assert_unimplemented(RangeRequest {
+            count_only: true,
+            ..plain_range()
+        });
+    }
+
+    #[test]
+    fn else_range_with_keys_only_is_unimplemented() {
+        assert_unimplemented(RangeRequest {
+            keys_only: true,
+            ..plain_range()
+        });
+    }
+
+    #[test]
+    fn else_range_with_sort_is_unimplemented() {
+        assert_unimplemented(RangeRequest {
+            sort_order: 1,
+            ..plain_range()
+        });
+    }
+
+    #[test]
+    fn else_range_with_large_limit_is_unimplemented() {
+        assert_unimplemented(RangeRequest {
+            limit: 2,
+            ..plain_range()
+        });
+    }
+
+    #[test]
+    fn plain_else_range_on_the_compared_key_is_accepted() {
+        for limit in [0, 1] {
+            let range = RangeRequest {
+                limit,
+                ..plain_range()
+            };
+            let txn = parse_txn(&txn_with_else(range)).expect("accepted");
+            assert!(txn.read_on_failure);
+        }
+    }
 }
