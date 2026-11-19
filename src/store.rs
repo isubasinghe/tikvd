@@ -189,9 +189,17 @@ impl Store {
         compare: Option<Compare>,
         write: Write,
     ) -> Result<WriteOutcome, StoreError> {
+        let mut lock_retries = 0;
         loop {
-            if let Attempt::Done(outcome) = self.try_write(key, compare, &write).await? {
-                return Ok(outcome);
+            match self.try_write(key, compare, &write).await {
+                Ok(Attempt::Done(outcome)) => return Ok(outcome),
+                Ok(Attempt::Conflict) => {}
+                Err(error)
+                    if is_unresolved_lock(&error) && lock_retries < UNRESOLVED_LOCK_RETRIES =>
+                {
+                    lock_retries += 1;
+                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -201,9 +209,17 @@ impl Store {
         key: &[u8],
         range_end: &[u8],
     ) -> Result<(i64, i64), StoreError> {
+        let mut lock_retries = 0;
         loop {
-            if let Some(done) = self.try_delete_range(key, range_end).await? {
-                return Ok(done);
+            match self.try_delete_range(key, range_end).await {
+                Ok(Some(done)) => return Ok(done),
+                Ok(None) => {}
+                Err(error)
+                    if is_unresolved_lock(&error) && lock_retries < UNRESOLVED_LOCK_RETRIES =>
+                {
+                    lock_retries += 1;
+                }
+                Err(error) => return Err(error),
             }
         }
     }
@@ -289,8 +305,8 @@ impl Store {
         match write {
             Write::Put { value, ttl_secs } => {
                 let record = next_record(prev_record, value, *ttl_secs, txn.start_timestamp());
-                stage_ttl_index(&mut txn, key, prev_record, record.lease_expiry).await?;
                 txn.put(data_key(key), record.encode()).await?;
+                stage_ttl_index(&mut txn, key, prev_record, record.lease_expiry).await?;
             }
             Write::Delete if current.is_none() => {
                 return Ok(Attempt::Done(WriteOutcome::Applied {
@@ -461,9 +477,8 @@ async fn stage_delete(
     key: &[u8],
     prev: Option<&Record>,
 ) -> Result<(), StoreError> {
-    stage_ttl_index(txn, key, prev, 0).await?;
     txn.delete(data_key(key)).await?;
-    Ok(())
+    stage_ttl_index(txn, key, prev, 0).await
 }
 
 async fn commit_unless_conflicted(txn: &mut Transaction) -> Result<Option<i64>, StoreError> {
@@ -487,6 +502,22 @@ fn is_write_conflict(error: &tikv_client::Error) -> bool {
     match error {
         tikv_client::Error::KeyError(key_error) => key_error.conflict.is_some(),
         tikv_client::Error::MultipleKeyErrors(errors) => errors.iter().any(is_write_conflict),
+        _ => false,
+    }
+}
+
+const UNRESOLVED_LOCK_RETRIES: usize = 3;
+
+fn is_unresolved_lock(error: &StoreError) -> bool {
+    matches!(error, StoreError::Tikv(error) if is_unresolved_lock_error(error))
+}
+
+fn is_unresolved_lock_error(error: &tikv_client::Error) -> bool {
+    match error {
+        tikv_client::Error::TxnNotFound(_) | tikv_client::Error::ResolveLockError(_) => true,
+        tikv_client::Error::MultipleKeyErrors(errors) => {
+            !errors.is_empty() && errors.iter().all(is_unresolved_lock_error)
+        }
         _ => false,
     }
 }
@@ -587,6 +618,40 @@ mod tests {
             logical: 7,
             ..Default::default()
         }
+    }
+
+    fn txn_not_found() -> tikv_client::Error {
+        tikv_client::Error::TxnNotFound(Default::default())
+    }
+
+    #[test]
+    fn an_unresolvable_lock_met_before_the_commit_point_is_retried() {
+        for error in [
+            txn_not_found(),
+            tikv_client::Error::ResolveLockError(Vec::new()),
+            tikv_client::Error::MultipleKeyErrors(vec![
+                txn_not_found(),
+                tikv_client::Error::ResolveLockError(Vec::new()),
+            ]),
+        ] {
+            assert!(is_unresolved_lock(&StoreError::Tikv(error)));
+        }
+    }
+
+    #[test]
+    fn an_undetermined_commit_or_any_other_error_is_not_retried() {
+        for error in [
+            tikv_client::Error::UndeterminedError(Box::new(txn_not_found())),
+            tikv_client::Error::MultipleKeyErrors(vec![
+                txn_not_found(),
+                tikv_client::Error::Unimplemented,
+            ]),
+            tikv_client::Error::Unimplemented,
+            tikv_client::Error::MultipleKeyErrors(Vec::new()),
+        ] {
+            assert!(!is_unresolved_lock(&StoreError::Tikv(error)));
+        }
+        assert!(!is_unresolved_lock(&StoreError::Compacted));
     }
 
     #[test]

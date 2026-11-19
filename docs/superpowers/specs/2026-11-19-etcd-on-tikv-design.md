@@ -253,7 +253,33 @@ its commit timestamp, evaluate the compare, write, commit. TiKV's own write-conf
 atomic. On write conflict the whole operation is retried from the read, so
 the compare is re-evaluated against the new state. A put with a lease also
 writes the TTL index key, and removes the old index key if the expiry
-changed.
+changed. The data key is staged first, so it is the transaction's primary
+and is committed before `commit` returns; the TTL index key is a secondary
+that the client commits afterwards. A read or prewrite that meets another
+transaction's lock it cannot resolve (`TxnNotFound`, "Failed to resolve
+lock") is also retried from the read: it happens before this attempt's
+primary commit, and the client reports any commit whose outcome is unknown
+as undetermined instead.
+
+A write is acknowledged only after this instance has delivered it. Once a
+`Put`, a `DeleteRange` that deleted something, or a `Txn` whose success
+branch put or deleted a key has committed at revision R, the response
+waits until this instance's watch hub has applied a watermark of at least
+R, that is, until R's events are queued to every watcher on this
+instance. A feed reset releases the wait, because it cancels every
+watcher. The wait is bounded by a 1 s deadline; on expiry the write is
+acknowledged as the success it is and a warning names the revision and
+the watermark. Failed compares, deletes of a missing key, `Compact`,
+`LeaseGrant` and the reaper's deletes do not wait.
+
+The guarantee is per instance. On the instance that served the write,
+its events are queued to every watcher before the response is sent,
+unless the deadline expired. A watcher on another instance has no
+guarantee; it sees the write after about the resolved-timestamp interval,
+as before. The cost is the watermark lag, paid by the writer: measured on
+one store at 10ms, write latency went from 11.6 / 22.7 ms (p50 / p99) to
+11.8 / 24.4 ms sequentially, and from 20.0 / 35.3 ms to 34.5 / 36.4 ms with
+16 concurrent writers.
 
 ### Watch
 
@@ -312,7 +338,8 @@ Progress notifications and `WatchProgressRequest` report the watermark.
 
 Watch delivery lags a commit by up to TiKV's resolved-timestamp interval
 plus the TSO and `check_leader` round trips TiKV makes to advance it;
-`tikvd` adds no wait of its own. The deployment guidance is to set
+`tikvd` adds no wait of its own. On the instance that served a write, the
+write's response waits out that lag instead (see KV and Txn). The deployment guidance is to set
 `cdc.min-ts-interval` to 10ms (fact 9). TiKV and PD spend more CPU the
 lower it is.
 
@@ -365,8 +392,14 @@ repo this way.)
 
 - Watch and progress lag by up to `cdc.min-ts-interval` plus TiKV's round
   trips to advance it: 5.6 ms p50 and 11.3 ms p99 at 10ms on one store
-  (fact 9). A client that writes and then acts on its watch cache sooner
-  than that can see the state from before its write.
+  (fact 9). A writer pays that lag in its write latency, and in return its
+  write is already queued to every watcher on the same instance when the
+  response arrives. A client that writes through one instance and watches
+  through another can still act on its watch cache before its write
+  arrives there.
+- A stalled feed delays every changing write on that instance by up to the
+  1 s delivery deadline, and such a write is acknowledged without the
+  same-instance guarantee.
 - Each instance holds its own CDC subscription to every region in the
   range, so CDC load on TiKV grows with the number of instances.
 - `count` on a paged list rescans the range's keys on every page.
@@ -484,6 +517,24 @@ different versions 1 of 2.
   the write, the winning ones 11 to 31 ms. Closing this race needs the lister to see a write within a few
   milliseconds of its response, which a resolved-timestamp watermark at
   10ms does not give.
+
+Re-run on 2026-11-19 after writes began to be acknowledged only once this
+instance had delivered them, with the data key as a leased put's primary,
+same cluster shape and suite, twice:
+
+- Full, `[Conformance]`, 30 and 29 min: 446 passed, 0 failed, 7133
+  skipped, both times. Gates: no `UNIMPLEMENTED`, no feed reset, cache
+  consistency asserted (441 and 421 checks, none failed). No write hit
+  the 1 s delivery deadline on either instance.
+- The CRD finalizer still met "storage is (re)initializing" (7 and 6
+  times), and every retry recovered: its retry read came 19 to 52 ms after
+  its own write and wrote.
+- kube-controller-manager logged 48 and 82 `is not as new as written
+  version` errors, against 1,140 before.
+- Mean `etcd_request_duration_seconds` at the end of the runs: create 38.0
+  and 38.6 ms, update 34.4 and 33.7, delete 25.7 and 24.4, get 1.8 and
+  1.5, list 1.9 and 1.6. Writes cost about 10 ms more than before, the
+  watermark lag they now wait out.
 
 ## Order of work
 

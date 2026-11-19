@@ -1,5 +1,8 @@
 #![allow(clippy::result_large_err)]
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use tonic::{Request, Response, Status};
 use tracing::{debug, warn};
 
@@ -11,6 +14,7 @@ use crate::pb::etcdserverpb::{
 };
 use crate::pb::mvccpb;
 use crate::store::{self, RangeQuery, Store, StoreError, Write, WriteOutcome};
+use crate::watch_hub::WatchHub;
 
 const CLUSTER_ID: u64 = 0x7469_6b76_6401;
 pub(crate) const MEMBER_ID: u64 = 0x7469_6b76_6402;
@@ -18,14 +22,30 @@ pub(crate) const RAFT_TERM: u64 = 1;
 
 const COMPACTED: &str = "etcdserver: mvcc: required revision has been compacted";
 const FUTURE_REVISION: &str = "etcdserver: mvcc: required revision is a future revision";
+const DELIVERY_DEADLINE: Duration = Duration::from_secs(1);
 
 pub struct KvService {
     store: Store,
+    hub: Arc<WatchHub>,
 }
 
 impl KvService {
-    pub fn new(store: Store) -> Self {
-        KvService { store }
+    pub fn new(store: Store, hub: Arc<WatchHub>) -> Self {
+        KvService { store, hub }
+    }
+
+    async fn delivered_locally(&self, revision: i64) {
+        if tokio::time::timeout(DELIVERY_DEADLINE, self.hub.delivered(revision))
+            .await
+            .is_err()
+        {
+            // ponytail: a stalled feed delays each write by up to DELIVERY_DEADLINE and then acks it without read-your-write; report not serving while the feed stalls if this fires outside disruptions
+            warn!(
+                revision,
+                watermark = self.hub.watermark(),
+                "acknowledging a write this instance has not delivered to its watchers"
+            );
+        }
     }
 
     async fn range_response(&self, request: &RangeRequest) -> Result<RangeResponse, Status> {
@@ -73,6 +93,7 @@ impl KvService {
         let WriteOutcome::Applied { revision, prev } = outcome else {
             return Err(Status::internal("unconditional put was rejected"));
         };
+        self.delivered_locally(revision).await;
         Ok(PutResponse {
             header: Some(header(revision)),
             prev_kv: prev.filter(|_| request.prev_kv).map(to_proto),
@@ -95,6 +116,9 @@ impl KvService {
             .delete_range(&request.key, &request.range_end)
             .await
             .map_err(status)?;
+        if deleted > 0 {
+            self.delivered_locally(revision).await;
+        }
         Ok(DeleteRangeResponse {
             header: Some(header(revision)),
             deleted,
@@ -111,6 +135,9 @@ impl KvService {
         let WriteOutcome::Applied { revision, prev } = outcome else {
             return Err(Status::internal("unconditional delete was rejected"));
         };
+        if prev.is_some() {
+            self.delivered_locally(revision).await;
+        }
         Ok(delete_response(revision, prev, prev_kv))
     }
 
@@ -132,11 +159,16 @@ impl KvService {
             .map_err(status)?;
 
         match outcome {
-            WriteOutcome::Applied { revision, prev } => Ok(TxnResponse {
-                header: Some(header(revision)),
-                succeeded: true,
-                responses: vec![applied_op(&txn.write, revision, prev)],
-            }),
+            WriteOutcome::Applied { revision, prev } => {
+                if changes_the_key(&txn.write, prev.as_ref()) {
+                    self.delivered_locally(revision).await;
+                }
+                Ok(TxnResponse {
+                    header: Some(header(revision)),
+                    succeeded: true,
+                    responses: vec![applied_op(&txn.write, revision, prev)],
+                })
+            }
             WriteOutcome::Rejected { revision, current } => Ok(TxnResponse {
                 header: Some(header(revision)),
                 succeeded: false,
@@ -317,6 +349,13 @@ fn reject_unsupported_else_range(range: &RangeRequest) -> Result<(), Status> {
         ));
     }
     Ok(())
+}
+
+fn changes_the_key(write: &TxnWrite, prev: Option<&store::KeyValue>) -> bool {
+    match write {
+        TxnWrite::Put { .. } => true,
+        TxnWrite::Delete { .. } => prev.is_some(),
+    }
 }
 
 fn applied_op(write: &TxnWrite, revision: i64, prev: Option<store::KeyValue>) -> ResponseOp {
