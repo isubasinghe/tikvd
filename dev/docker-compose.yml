@@ -30,4 +30,4 @@ configs:
   tikv:
     content: |
       [cdc]
-      min-ts-interval = "200ms"
+      min-ts-interval = "10ms"
