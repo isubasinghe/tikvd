@@ -1,6 +1,6 @@
 #![allow(clippy::result_large_err)]
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
@@ -14,7 +14,7 @@ use crate::pb::etcdserverpb::{
     LeaseLeasesRequest, LeaseLeasesResponse, LeaseRevokeRequest, LeaseRevokeResponse,
     LeaseTimeToLiveRequest, LeaseTimeToLiveResponse,
 };
-use crate::store::{Store, StoreError};
+use crate::store::{MAX_TTL_SECS, Store, StoreError};
 
 pub const REAP_INTERVAL: Duration = Duration::from_secs(1);
 const REAP_BATCH: u32 = 1000;
@@ -33,7 +33,7 @@ pub fn spawn_reaper(store: Store, interval: Duration) -> tokio::task::JoinHandle
 }
 
 async fn reap_expired(store: &Store) -> Result<(), StoreError> {
-    let index_keys = store.expired_ttl_keys(unix_now(), REAP_BATCH).await?;
+    let index_keys = store.expired_ttl_keys(REAP_BATCH).await?;
     for index_key in index_keys {
         let Some((expiry, key)) = parse_ttl_key(&index_key) else {
             warn!(?index_key, "unparseable ttl index key");
@@ -48,10 +48,21 @@ async fn reap_expired(store: &Store) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs())
+fn granted_ttl(request: &LeaseGrantRequest) -> Result<i64, Status> {
+    if request.ttl <= 0 {
+        return Err(Status::invalid_argument(
+            "etcdserver: lease ttl must be positive",
+        ));
+    }
+    if request.ttl > MAX_TTL_SECS {
+        return Err(Status::invalid_argument("etcdserver: too large lease TTL"));
+    }
+    if request.id != 0 {
+        return Err(Status::invalid_argument(
+            "etcdserver: client-chosen lease ids are not supported",
+        ));
+    }
+    Ok(request.ttl)
 }
 
 pub struct LeaseService {
@@ -72,16 +83,7 @@ impl Lease for LeaseService {
     ) -> Result<Response<LeaseGrantResponse>, Status> {
         let request = request.into_inner();
         debug!(rpc = "lease_grant", ttl = request.ttl, id = request.id);
-        if request.ttl <= 0 {
-            return Err(Status::invalid_argument(
-                "etcdserver: lease ttl must be positive",
-            ));
-        }
-        if request.id != 0 {
-            return Err(Status::invalid_argument(
-                "etcdserver: client-chosen lease ids are not supported",
-            ));
-        }
+        let ttl = granted_ttl(&request)?;
         let revision = self
             .store
             .now()
@@ -89,8 +91,8 @@ impl Lease for LeaseService {
             .map_err(|error| Status::unavailable(error.to_string()))?;
         Ok(Response::new(LeaseGrantResponse {
             header: Some(header(revision)),
-            id: request.ttl,
-            ttl: request.ttl,
+            id: ttl,
+            ttl,
             error: String::new(),
         }))
     }
@@ -123,5 +125,25 @@ impl Lease for LeaseService {
         _request: Request<LeaseLeasesRequest>,
     ) -> Result<Response<LeaseLeasesResponse>, Status> {
         Err(unsupported("lease_leases"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grant(ttl: i64) -> LeaseGrantRequest {
+        LeaseGrantRequest { ttl, id: 0 }
+    }
+
+    #[test]
+    fn lease_grant_ttl_larger_than_the_representable_range_is_rejected() {
+        assert_eq!(granted_ttl(&grant(MAX_TTL_SECS)).unwrap(), MAX_TTL_SECS);
+        for ttl in [MAX_TTL_SECS + 1, i64::MAX] {
+            assert_eq!(
+                granted_ttl(&grant(ttl)).unwrap_err().code(),
+                tonic::Code::InvalidArgument
+            );
+        }
     }
 }

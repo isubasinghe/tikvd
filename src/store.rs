@@ -1,7 +1,6 @@
 #![allow(clippy::result_large_err)]
 
 use std::fmt;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tikv_client::{
     CheckLevel, Config, Key, Snapshot, Timestamp, TimestampExt, Transaction, TransactionClient,
@@ -209,14 +208,10 @@ impl Store {
         }
     }
 
-    pub async fn expired_ttl_keys(
-        &self,
-        now_unix_secs: u64,
-        limit: u32,
-    ) -> Result<Vec<Vec<u8>>, StoreError> {
+    pub async fn expired_ttl_keys(&self, limit: u32) -> Result<Vec<Vec<u8>>, StoreError> {
         let read_at = self.client.current_timestamp().await?;
+        let (start, end) = ttl_range_until(unix_secs_at(&read_at));
         let mut snapshot = self.client.snapshot(read_at, read_options());
-        let (start, end) = ttl_range_until(now_unix_secs);
         let keys = snapshot.scan_keys(start..end, limit).await?;
         Ok(keys.map(Vec::from).collect())
     }
@@ -418,16 +413,26 @@ fn next_record(
     Record {
         version: prev.map_or(0, |prev| prev.version) + 1,
         created: prev.map_or(start_ts.version(), |prev| prev.created),
-        lease_expiry: ttl_secs.map_or(0, expiry_after),
+        lease_expiry: ttl_secs.map_or(0, |ttl| expiry_after(&start_ts, ttl)),
         value: value.to_vec(),
     }
 }
 
-fn expiry_after(ttl_secs: i64) -> u64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs());
-    now.saturating_add_signed(ttl_secs)
+const LATEST_TIMESTAMP_SECS: i64 = ((u64::MAX >> 18).div_ceil(1000)) as i64;
+pub const MAX_TTL_SECS: i64 = i64::MAX - LATEST_TIMESTAMP_SECS;
+
+fn physical_millis(ts: &Timestamp) -> u64 {
+    u64::try_from(ts.physical).unwrap_or(0)
+}
+
+fn unix_secs_at(ts: &Timestamp) -> u64 {
+    physical_millis(ts) / 1000
+}
+
+fn expiry_after(start: &Timestamp, ttl_secs: i64) -> u64 {
+    physical_millis(start)
+        .div_ceil(1000)
+        .saturating_add_signed(ttl_secs)
 }
 
 async fn stage_ttl_index(
@@ -567,5 +572,36 @@ fn to_key_value(key: Vec<u8>, record: Record, mod_revision: i64) -> KeyValue {
         create_revision,
         version: record.version,
         lease: record.lease_expiry as i64,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at_millis(physical: i64) -> Timestamp {
+        Timestamp {
+            physical,
+            logical: 7,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn expiry_rounds_the_start_up_to_a_whole_second() {
+        assert_eq!(expiry_after(&at_millis(1_000_001), 1), 1_002);
+        assert_eq!(expiry_after(&at_millis(1_000_000), 1), 1_001);
+    }
+
+    #[test]
+    fn now_rounds_down_to_a_whole_second() {
+        assert_eq!(unix_secs_at(&at_millis(1_000_999)), 1_000);
+        assert_eq!(unix_secs_at(&at_millis(1_000_000)), 1_000);
+    }
+
+    #[test]
+    fn the_largest_ttl_keeps_the_latest_expiry_representable() {
+        let latest = Timestamp::from_version(u64::MAX);
+        assert!(expiry_after(&latest, MAX_TTL_SECS) <= i64::MAX as u64);
     }
 }

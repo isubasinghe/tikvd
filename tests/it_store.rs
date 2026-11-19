@@ -27,11 +27,9 @@ fn key(prefix: &[u8], suffix: &str) -> Vec<u8> {
     [prefix, suffix.as_bytes()].concat()
 }
 
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+async fn pd_unix_secs(store: &Store) -> u64 {
+    let now = store.client().current_timestamp().await.unwrap();
+    now.physical as u64 / 1000
 }
 
 fn put(value: &str) -> Write {
@@ -568,11 +566,11 @@ async fn put_with_ttl_writes_index() {
     .await;
     let kv = get(&store, &k).await.unwrap();
     assert_ne!(kv.lease, 0);
-    assert!(ttl_index_contains(&store, &k, unix_now() + 61).await);
+    assert!(ttl_index_contains(&store, &k, pd_unix_secs(&store).await + 61).await);
 
     applied(&store, &k, None, put("v2")).await;
     assert_eq!(get(&store, &k).await.unwrap().lease, 0);
-    assert!(!ttl_index_contains(&store, &k, unix_now() + 61).await);
+    assert!(!ttl_index_contains(&store, &k, pd_unix_secs(&store).await + 61).await);
 }
 
 fn ttl_put(value: &str, ttl_secs: i64) -> Write {

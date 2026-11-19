@@ -387,6 +387,9 @@ fn reject_unsupported_put_options(request: &PutRequest) -> Result<(), Status> {
 fn ttl_of(lease: i64) -> Result<Option<i64>, Status> {
     match lease {
         0 => Ok(None),
+        ttl if ttl > store::MAX_TTL_SECS => {
+            Err(Status::invalid_argument("etcdserver: too large lease TTL"))
+        }
         ttl if ttl > 0 => Ok(Some(ttl)),
         _ => Err(Status::invalid_argument(
             "etcdserver: lease id must not be negative",
@@ -615,6 +618,27 @@ mod tests {
         .err()
         .expect("rejected");
         assert_eq!(error.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn ttl_larger_than_the_representable_range_is_rejected() {
+        assert_eq!(
+            ttl_of(store::MAX_TTL_SECS).unwrap(),
+            Some(store::MAX_TTL_SECS)
+        );
+        for lease in [store::MAX_TTL_SECS + 1, i64::MAX] {
+            assert_eq!(
+                ttl_of(lease).unwrap_err().code(),
+                tonic::Code::InvalidArgument
+            );
+            let error = parse_txn(&txn_with_put(PutRequest {
+                lease,
+                ..Default::default()
+            }))
+            .err()
+            .expect("rejected");
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+        }
     }
 
     #[test]
