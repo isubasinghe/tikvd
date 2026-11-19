@@ -45,21 +45,24 @@ async fn key_with_ttl_disappears_and_watchers_see_delete() {
         return;
     };
     let key = format!("{}a", unique_prefix("it-lease"));
-    put_with_ttl(&mut client, &key, 1).await;
     let (_watcher, mut stream) = client.watch(key.as_str(), None).await.unwrap();
+    put_with_ttl(&mut client, &key, 1).await;
 
-    let event = timeout(DEADLINE, async {
+    let deletes = timeout(DEADLINE, async {
         loop {
             let response = stream.message().await.unwrap().unwrap();
-            if let Some(event) = response.events().first() {
-                return event.event_type();
+            if response
+                .events()
+                .iter()
+                .any(|event| event.event_type() == EventType::Delete)
+            {
+                return;
             }
         }
     })
-    .await
-    .expect("a delete event within the deadline");
+    .await;
 
-    assert_eq!(event, EventType::Delete);
+    assert!(deletes.is_ok(), "no delete event within the deadline");
     assert!(!key_exists(&mut client, &key).await);
 }
 
