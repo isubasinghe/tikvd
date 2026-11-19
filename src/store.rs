@@ -189,11 +189,16 @@ impl Store {
         compare: Option<Compare>,
         write: Write,
     ) -> Result<WriteOutcome, StoreError> {
+        let mut lock_retries = 0;
         loop {
             match self.try_write(key, compare, &write).await {
                 Ok(Attempt::Done(outcome)) => return Ok(outcome),
                 Ok(Attempt::Conflict) => {}
-                Err(error) if is_unresolved_lock(&error) => {}
+                Err(error)
+                    if is_unresolved_lock(&error) && lock_retries < UNRESOLVED_LOCK_RETRIES =>
+                {
+                    lock_retries += 1;
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -204,11 +209,16 @@ impl Store {
         key: &[u8],
         range_end: &[u8],
     ) -> Result<(i64, i64), StoreError> {
+        let mut lock_retries = 0;
         loop {
             match self.try_delete_range(key, range_end).await {
                 Ok(Some(done)) => return Ok(done),
                 Ok(None) => {}
-                Err(error) if is_unresolved_lock(&error) => {}
+                Err(error)
+                    if is_unresolved_lock(&error) && lock_retries < UNRESOLVED_LOCK_RETRIES =>
+                {
+                    lock_retries += 1;
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -496,6 +506,8 @@ fn is_write_conflict(error: &tikv_client::Error) -> bool {
     }
 }
 
+const UNRESOLVED_LOCK_RETRIES: usize = 3;
+
 fn is_unresolved_lock(error: &StoreError) -> bool {
     matches!(error, StoreError::Tikv(error) if is_unresolved_lock_error(error))
 }
@@ -504,7 +516,7 @@ fn is_unresolved_lock_error(error: &tikv_client::Error) -> bool {
     match error {
         tikv_client::Error::TxnNotFound(_) | tikv_client::Error::ResolveLockError(_) => true,
         tikv_client::Error::MultipleKeyErrors(errors) => {
-            errors.iter().all(is_unresolved_lock_error)
+            !errors.is_empty() && errors.iter().all(is_unresolved_lock_error)
         }
         _ => false,
     }
@@ -635,6 +647,7 @@ mod tests {
                 tikv_client::Error::Unimplemented,
             ]),
             tikv_client::Error::Unimplemented,
+            tikv_client::Error::MultipleKeyErrors(Vec::new()),
         ] {
             assert!(!is_unresolved_lock(&StoreError::Tikv(error)));
         }
