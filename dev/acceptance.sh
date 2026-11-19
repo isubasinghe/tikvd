@@ -15,6 +15,7 @@ NODE_CONTAINER=k3d-$CLUSTER_NAME-server-0
 CLUSTER_NETWORK=k3d-$CLUSTER_NAME
 CLUSTER_SUBNET=172.29.42.0/24
 HOST_GATEWAY=172.29.42.1
+TIKVD_BINARY=$REPO_ROOT/target/release/tikvd
 WORKFLOW_TIMEOUT_SECS=300
 SOAK_SECS=${SOAK_SECS:-0}
 DISRUPT=${DISRUPT:-0}
@@ -81,18 +82,27 @@ tikvd_feed_started() { tail -n "+$(($2 + 1))" "$(tikvd_log "$1")" | grep -q "cdc
 start_tikvd() {
     local port=$1 lines_before=0
     [[ -f $(tikvd_log "$port") ]] && lines_before=$(wc -l <"$(tikvd_log "$port")")
-    NO_COLOR=1 RUST_LOG=$TIKVD_LOG_FILTER "$REPO_ROOT/target/release/tikvd" \
+    NO_COLOR=1 RUST_LOG=$TIKVD_LOG_FILTER "$TIKVD_BINARY" \
         --listen "0.0.0.0:$port" --pd "$PD_ADDRESS" >>"$(tikvd_log "$port")" 2>&1 &
     echo $! >"$(tikvd_pid_file "$port")"
     wait_until 60 "tikvd on :$port" tikvd_feed_started "$port" "$lines_before"
     say "tikvd on :$port started (pid $(cat "$(tikvd_pid_file "$port")"))"
 }
 
+is_own_tikvd() {
+    local exe
+    exe=$(readlink "/proc/$1/exe" 2>/dev/null) || return 1
+    [[ $exe == "$TIKVD_BINARY" || $exe == "$TIKVD_BINARY (deleted)" ]]
+}
+
 stop_tikvd() {
-    local pid_file
+    local pid_file pid
     pid_file=$(tikvd_pid_file "$1")
     [[ -f $pid_file ]] || return 0
-    kill "$(cat "$pid_file")" 2>/dev/null || true
+    pid=$(cat "$pid_file")
+    if is_own_tikvd "$pid"; then
+        kill "$pid" 2>/dev/null || true
+    fi
     rm -f "$pid_file"
 }
 
