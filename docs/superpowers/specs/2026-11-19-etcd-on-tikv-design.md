@@ -135,11 +135,31 @@ These are the builder's calls, not decisions the user made.
 - The TiKV cluster is dedicated to `tikvd` and runs API V1. Compaction
   moves the cluster-wide GC safepoint, which would destroy history for any
   other tenant.
-- The target is the current stable k3s release at the time step 4 starts.
-  The exact request shapes in this document are from memory of
-  kube-apiserver's etcd3 storage code and are confirmed in step 1 by
-  logging every request a real k3s server sends and failing loudly on any
-  unsupported one.
+- The target is k3s v1.36.2+k3s1 (`rancher/k3s:v1.36.2-k3s1`, etcd client
+  v3.6.12-k3s1), run by `dev/acceptance.sh` against two `tikvd` instances
+  with Argo Workflows v4.1.6 installed. The request shapes below were
+  observed on 2026-11-19 by logging every request it sent; every one was
+  served and none returned `UNIMPLEMENTED`.
+  - `Range`: a single key with `limit` 0 or 1; a key range with `limit` 0
+    or 10000 at `revision` 0, or with `limit` 10000 at an explicit
+    revision (the cache consistency checker, whose CRD list is about 6 MB);
+    a key range with `count_only`. `keys_only`, sort and the revision
+    filters were never sent.
+  - `Txn`, always one `Equal` compare on one key, then one op on that key:
+    `mod_revision = 0` then `Put` (with or without a lease), with an empty
+    else or an else `Range` of that key; `mod_revision = R` then `Put`
+    (with or without a lease) else `Range`; `mod_revision = R` then
+    `DeleteRange` else `Range`; `version = N` on `compact_rev_key` then
+    `Put` else `Range` (the compactor). The else `Range` never carried
+    options. `prev_kv`, `ignore_value` and `ignore_lease` were never set.
+  - Bare `Put` and bare `DeleteRange` were never sent.
+  - `Watch` create: key ranges with `prev_kv` and `progress_notify`, and
+    one single-key watch on `compact_rev_key` with neither; always a
+    positive `start_revision`, no filters, no client watch IDs. Watch
+    progress requests are sent continually.
+  - `LeaseGrant` with TTL 15 and 3660 and no ID. No other lease call.
+  - `Compact` every five minutes after the first compactor round.
+  - `Maintenance.Status`. No other maintenance call.
 
 ## Design
 
