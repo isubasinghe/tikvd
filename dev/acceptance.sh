@@ -12,9 +12,10 @@ PD_ADDRESS=127.0.0.1:2379
 TIKVD_PORTS=(2479 2480)
 TIKVD_LOG_FILTER=info,tikvd=debug
 NODE_CONTAINER=k3d-$CLUSTER_NAME-server-0
-CLUSTER_NETWORK=k3d-$CLUSTER_NAME
-CLUSTER_SUBNET=172.29.42.0/24
-HOST_GATEWAY=172.29.42.1
+CLUSTER_NETWORK=$CLUSTER_NAME-net
+NETWORK_LABEL=tikvd.acceptance=$CLUSTER_NAME
+CLUSTER_SUBNET=${TIKVD_ACC_SUBNET:-172.29.42.0/24}
+HOST_GATEWAY=$(python3 -I -c 'import ipaddress, sys; print(next(ipaddress.ip_network(sys.argv[1]).hosts()))' "$CLUSTER_SUBNET")
 TIKVD_BINARY=$REPO_ROOT/target/release/tikvd
 WORKFLOW_TIMEOUT_SECS=300
 SOAK_SECS=${SOAK_SECS:-0}
@@ -58,6 +59,7 @@ cleanup() {
     for port in "${TIKVD_PORTS[@]}"; do
         stop_tikvd "$port"
     done
+    remove_own_network
     exit "$status"
 }
 
@@ -83,7 +85,7 @@ start_tikvd() {
     local port=$1 lines_before=0
     [[ -f $(tikvd_log "$port") ]] && lines_before=$(wc -l <"$(tikvd_log "$port")")
     NO_COLOR=1 RUST_LOG=$TIKVD_LOG_FILTER "$TIKVD_BINARY" \
-        --listen "0.0.0.0:$port" --pd "$PD_ADDRESS" >>"$(tikvd_log "$port")" 2>&1 &
+        --listen "$HOST_GATEWAY:$port" --pd "$PD_ADDRESS" >>"$(tikvd_log "$port")" 2>&1 &
     echo $! >"$(tikvd_pid_file "$port")"
     wait_until 60 "tikvd on :$port" tikvd_feed_started "$port" "$lines_before"
     say "tikvd on :$port started (pid $(cat "$(tikvd_pid_file "$port")"))"
@@ -123,19 +125,55 @@ datastore_endpoint() {
     echo "${endpoints[*]}"
 }
 
-cluster_gateway() {
-    docker network inspect "$CLUSTER_NETWORK" --format '{{range .IPAM.Config}}{{.Gateway}}{{end}}'
+network_is_own() {
+    [[ $(docker network inspect "$CLUSTER_NETWORK" --format '{{index .Labels "tikvd.acceptance"}}' 2>/dev/null) == "$CLUSTER_NAME" ]]
+}
+
+remove_own_network() {
+    if network_is_own; then
+        docker network rm "$CLUSTER_NETWORK" >/dev/null
+    fi
+}
+
+subnets_overlap() {
+    python3 -I -c 'import ipaddress, sys; sys.exit(not ipaddress.ip_network(sys.argv[1]).overlaps(ipaddress.ip_network(sys.argv[2])))' "$1" "$2"
+}
+
+network_using_subnet() {
+    local name subnet
+    for name in $(docker network ls --format '{{.Name}}'); do
+        for subnet in $(docker network inspect "$name" --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}'); do
+            if subnets_overlap "$subnet" "$CLUSTER_SUBNET" 2>/dev/null; then
+                echo "$name"
+                return 0
+            fi
+        done
+    done
+    return 1
+}
+
+create_network() {
+    local taken_by
+    if docker network inspect "$CLUSTER_NETWORK" >/dev/null 2>&1 && ! network_is_own; then
+        fail "a network named $CLUSTER_NETWORK exists and was not created by this script"
+    fi
+    remove_own_network
+    if taken_by=$(network_using_subnet); then
+        fail "subnet $CLUSTER_SUBNET is already used by docker network $taken_by; set TIKVD_ACC_SUBNET to a free subnet"
+    fi
+    docker network create --driver bridge --subnet "$CLUSTER_SUBNET" --gateway "$HOST_GATEWAY" \
+        --label "$NETWORK_LABEL" "$CLUSTER_NETWORK" >/dev/null
+    say "created network $CLUSTER_NETWORK ($CLUSTER_SUBNET); tikvd listens on $HOST_GATEWAY only"
 }
 
 create_cluster() {
     say "creating k3d cluster $CLUSTER_NAME ($K3S_IMAGE) on $(datastore_endpoint "$HOST_GATEWAY")"
     k3d cluster create "$CLUSTER_NAME" \
-        --image "$K3S_IMAGE" --servers 1 --agents 0 --no-lb --subnet "$CLUSTER_SUBNET" \
+        --image "$K3S_IMAGE" --servers 1 --agents 0 --no-lb --network "$CLUSTER_NETWORK" \
         --k3s-arg "--datastore-endpoint=$(datastore_endpoint "$HOST_GATEWAY")@server:0" \
         --kubeconfig-update-default=false --kubeconfig-switch-context=false \
         --timeout 300s >"$WORK_DIR/k3d-create.log" 2>&1 || fail "k3d cluster create (see $WORK_DIR/k3d-create.log)"
     k3d kubeconfig get "$CLUSTER_NAME" >"$KUBECONFIG"
-    [[ $(cluster_gateway) == "$HOST_GATEWAY" ]] || fail "$CLUSTER_NETWORK gateway is $(cluster_gateway), not $HOST_GATEWAY"
 }
 
 node_is_ready() {
@@ -262,6 +300,7 @@ main() {
     fetch_argo_manifests
     build_tikvd
     recreate_tikv
+    create_network
     for port in "${TIKVD_PORTS[@]}"; do
         start_tikvd "$port"
     done
