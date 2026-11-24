@@ -9,7 +9,7 @@ pub fn data_key(etcd_key: &[u8]) -> Vec<u8> {
 }
 
 pub fn etcd_key(data_key: &[u8]) -> Option<&[u8]> {
-    data_key.strip_prefix(DATA_PREFIX)
+    data_key.strip_prefixDATA_PREFIX)
 }
 
 pub fn data_range(key: &[u8], range_end: &[u8]) -> (Vec<u8>, Vec<u8>) {
